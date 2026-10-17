@@ -1,0 +1,255 @@
+name: Issue & PR Intake
+
+# Everything here is intake bookkeeping, not verification. `ci.yml` builds and tests the app;
+# this workflow makes issues and PRs routable, greets newcomers, and hands work to contributors.
+#
+# Issue forms apply bug/enhancement labels. Maintainers handle further classification.
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, edited, synchronize]
+
+# Least privilege: this workflow reads the repo and writes labels, comments, and assignees.
+# It never needs contents: write and never touches releases.
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # First-time contributor welcome.
+  # ---------------------------------------------------------------------------------------------
+  welcome:
+    name: Welcome
+    if: >-
+      (github.event_name == 'issues' || github.event_name == 'pull_request') && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Greet first-time contributors
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          ASSOCIATION: ${{ github.event.issue.author_association || github.event.pull_request.author_association }}
+          TARGET: >-
+            ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+
+          case "$ASSOCIATION" in
+            FIRST_TIME_CONTRIBUTOR|FIRST_TIMER) ;;
+            *) echo "'${ACTOR}' is a ${ASSOCIATION}; no welcome."; exit 0 ;;
+          esac
+
+          # Piped rather than `--body "$(cat <<'EOF' …)"`: a quoted heredoc nested inside a
+          # command substitution re-tokenizes its body, so any apostrophe in the text ("you'll")
+          # becomes an unterminated quote and the whole step fails to parse. Piping the heredoc
+          # straight into --body-file keeps the body literal and out of the shell's way.
+          cat <<'EOF' | gh issue comment --repo "$REPO" "$TARGET" --body-file -
+          Welcome — thanks for filing this. A maintainer will take a look.
+
+          A few things that will speed it up:
+
+          - **Logs can help diagnose bugs.** You can export them from Preferences → About
+            and attach them to the issue.
+          - **Extension bugs belong elsewhere.** Issues about a specific community extension go to
+            [openclip-extensions](https://github.com/ganeshmshetty/openclip-extensions/issues).
+          - **Want to help?** Say so in a comment. You can also use `/claim` on an issue to
+            request assignment.
+
+          Working on the code? The architecture rules are in
+          [AGENTS.md](https://github.com/ganeshmshetty/talkra/blob/main/AGENTS.md) and the
+          contributor guide is in
+          [CONTRIBUTING.md](https://github.com/ganeshmshetty/talkra/blob/main/CONTRIBUTING.md).
+          EOF
+
+  # ---------------------------------------------------------------------------------------------
+  # Duplicate detection. Deliberately conservative: it comments, it never closes, and it stays
+  # silent unless the overlap is strong. A noisy duplicate bot gets muted, and a muted one is
+  # worse than none.
+  # ---------------------------------------------------------------------------------------------
+  duplicate-check:
+    name: Duplicate Check
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Look for likely duplicates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          set -euo pipefail
+
+          # Drop the "[Bug]: " / "[Feature]: " prefix, punctuation, and short or stopword
+          # tokens, then keep only the distinctive words.
+          # `tokens=(...)` rather than `read -r -a tokens <<< "$(...)"`: read consumes a single
+          # line, so the herestring form would keep only the first word and leave `total` at 1 —
+          # which makes the job skip every issue and quietly never find a duplicate.
+          # shellcheck disable=SC2206
+          tokens=($(
+            printf '%s' "$TITLE" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -e 's/^[[][^]]*[]][[:space:]]*//' -e 's/[^a-z0-9[:space:]]/ /g' \
+              | tr ' ' '\n' \
+              | grep -vxF -e the -e and -e with -e that -e this -e from -e when -e then -e not \
+                            -e you -e your -e for -e but -e are -e was -e has -e have -e had \
+                            -e does -e dont -e doesnt -e cant -e cannot -e will -e would -e should \
+                            -e could -e about -e into -e out -e off -e its -e it -e of -e to -e in \
+                            -e on -e at -e is -e be -e as -e an -e or -e if -e do -e did -e my \
+              | awk 'length($0) >= 4' \
+              | sort -u
+          ))
+
+          total="${#tokens[@]}"
+          # Two distinctive words is a coincidence more often than it is a duplicate. Below that,
+          # the bot has nothing useful to say, so it says nothing.
+          if [ "$total" -lt 2 ]; then
+            echo "Title has fewer than 2 distinctive words; skipping."
+            exit 0
+          fi
+
+          tokens_json="$(printf '%s\n' "${tokens[@]}" | jq -R . | jq -s .)"
+
+          # The newest issues are the most likely duplicates, so a bounded recent window is both
+          # cheaper and more relevant than scanning all history. Values cross into jq as
+          # --argjson rather than by splicing shell variables into the single-quoted program,
+          # which is far easier to get subtly wrong.
+          #
+          # Two jq traps worth naming, because both produce a wrong answer rather than an error:
+          #   * `$toks[] as $tok` — in `$t | test(PATTERN)`, the pattern is evaluated with `.`
+          #     bound to `$t`, so `.` is the whole title, not the token. Bind the token to a
+          #     variable explicitly.
+          #   * `select(...)` is what filters. `[ $toks[] as $tok | test(...) ]` collects one
+          #     boolean per token, so its length is the token count for every candidate.
+          matches="$(gh issue list --repo "$REPO" --state open --limit 100 --json number,title \
+            | jq -c --argjson toks "$tokens_json" --argjson self "$ISSUE_NUMBER" --argjson total "$total" '
+                [ .[]
+                  | select(.number != $self)
+                  | (.title | ascii_downcase) as $t
+                  | ([ $toks[] as $tok
+                       | select($t | test("(^|[^a-z0-9])" + $tok + "([^a-z0-9]|$)")) ]
+                     | length) as $hits
+                  # Explicit $hits: `{ hits }` is jq field shorthand and reads `.hits` off the
+                  # input object, which is not where the count lives — it silently yields null.
+                  | { number: .number, title: .title, hits: $hits }
+                ]
+                | map(select(.hits >= 2 and (.hits * 2 >= $total)))
+                | sort_by(-.hits) | .[0:3]
+              ')"
+
+          count="$(printf '%s' "$matches" | jq 'length')"
+          if [ "$count" -eq 0 ]; then
+            echo "No likely duplicates."
+            exit 0
+          fi
+
+          {
+            echo "Checked for existing reports before filing — these may already cover this:"
+            echo
+            printf '%s' "$matches" | jq -r --arg total "$total" '.[] | "- #\(.number) — \(.title) (\(.hits)/\($total) keywords in common)"'
+            echo
+            echo "If one of these is the same problem, add a comment there and this one can be closed."
+            echo "Otherwise, no action needed — a maintainer will pick this up."
+          } | gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file -
+
+  # ---------------------------------------------------------------------------------------------
+  # /claim
+  # ---------------------------------------------------------------------------------------------
+  claim:
+    name: Claim
+    if: github.event_name == 'issue_comment' && github.event.action == 'created' && !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          STATE: ${{ github.event.issue.state }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          # This workflow's own comments re-enter the `issue_comment` trigger. Without this the
+          # bot would read its own checklist, not match /claim, and exit — but only by luck of
+          # ordering, which is not something to leave to chance.
+          if [ "$ACTOR" = "github-actions[bot]" ]; then
+            exit 0
+          fi
+
+          if ! printf '%s' "$BODY" | tr '[:upper:]' '[:lower:]' | grep -qE '^[[:space:]]*/?claim([[:space:]]|$)'; then
+            exit 0
+          fi
+
+          if [ "$STATE" != "open" ]; then
+            echo "Issue is closed; not claiming."
+            exit 0
+          fi
+
+          # One claim per issue. Silently ignore the second rather than erroring, so two people
+          # racing for the same issue produces a no-op instead of a red run.
+          issue="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}")"
+          assignee="$(printf '%s' "$issue" | jq -r '.assignees | length')"
+          if [ "$assignee" -gt 0 ]; then
+            already="$(printf '%s' "$issue" | jq -r '.assignees[0].login')"
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+              "@${ACTOR} — this one is already claimed by @${already}. Comment here if you'd like to pair on it."
+            exit 0
+          fi
+          if printf '%s' "$issue" | jq -e '[.labels[].name] | index("status:claimed")' >/dev/null; then
+            echo "Already labelled status:claimed."
+            exit 0
+          fi
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$ACTOR" --add-label "status:claimed"
+
+          # Unquoted heredoc so @${ACTOR} and #${ISSUE_NUMBER} expand. Piped to --body-file for
+          # the same reason as the welcome job: see the note there.
+          cat <<EOF | gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file -
+          @${ACTOR} — this one is yours.
+
+          Worth knowing before you start:
+
+          - Claiming is optional. For substantial work, coordinate in the issue before starting
+            so contributors do not duplicate effort.
+          - Set up with \`git clone\` + \`xcodegen generate\`. The Xcode project is generated from
+            \`project.yml\` — never edit \`Talkra.xcodeproj\` by hand.
+          - Before pushing: \`./scripts/test.sh core\` for a sub-second gate, then
+            \`./scripts/test.sh\` for the full suite. Both must pass with 0 failures.
+          - The architecture hard rules are in
+            [AGENTS.md](https://github.com/ganeshmshetty/talkra/blob/main/AGENTS.md) — especially
+            Core purity, \`SettingsStore\` over \`UserDefaults\`, and the logging rules.
+          - If you stop working on this, leave a comment so a maintainer can release the assignment.
+            Maintainers may check in and release inactive assignments.
+
+          Issue links are optional. Use \`Fixes #${ISSUE_NUMBER}\` if the PR resolves the issue,
+          or \`Related to #${ISSUE_NUMBER}\` if it addresses only part of it.
+          EOF
+
+  # ---------------------------------------------------------------------------------------------
+  # PR intake. This job's name is the required status check configured on main — if you rename
+  # it here, update branch protection to match, or nothing will be able to merge.
+  # ---------------------------------------------------------------------------------------------
+  pr-intake:
+    name: PR Intake
+    if: github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'edited')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remind authors to describe their changes
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # Ignore template guidance and headings. This is a reminder, not a merge gate.
+          prose="$(printf '%s' "$PR_BODY" | perl -0pe 's/<!--.*?-->//gs' | sed '/^[[:space:]]*#/d' | tr -d '[:space:]')"
+          if [ -z "$prose" ]; then
+            echo "::warning title=PR description::Please explain what changed, why, and how you verified it. Issue links are optional."
+          fi

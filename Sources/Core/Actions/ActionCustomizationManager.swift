@@ -1,0 +1,189 @@
+// ActionCustomizationManager.swift
+// OpenClip
+//
+// Manages user-configured overrides for action titles and icons, persisting customizations via the Settings Door.
+// Provides display title and icon resolution for popup and table surfaces based on user preferences.
+import Foundation
+import Combine
+
+public enum ActionPresentationSurface: Sendable {
+    case popup
+    case table
+}
+
+public struct ActionPresentationModel: Sendable, Equatable {
+    public let title: String
+    public let icon: ActionIcon
+
+    public init(title: String, icon: ActionIcon) {
+        self.title = title
+        self.icon = icon
+    }
+}
+
+public struct ActionOverride: Codable, Sendable, Equatable {
+    public var customTitle: String?
+    public var customIconSymbol: String?
+    public var customIconText: String?
+    public var deliveryPreference: ResultDeliveryPreference?
+    
+    public init(
+        customTitle: String? = nil,
+        customIconSymbol: String? = nil,
+        customIconText: String? = nil,
+        deliveryPreference: ResultDeliveryPreference? = nil
+    ) {
+        self.customTitle = customTitle
+        self.customIconSymbol = customIconSymbol
+        self.customIconText = customIconText
+        self.deliveryPreference = deliveryPreference
+    }
+}
+
+@MainActor
+public final class ActionCustomizationManager: ObservableObject, ActionPresenting, Sendable {
+    public static let shared = ActionCustomizationManager()
+    
+    @Published public private(set) var overrides: [String: ActionOverride] = [:]
+    private let settingsStore: SettingsStore
+    
+    public init(settingsStore: SettingsStore = DefaultSettingsStore.shared) {
+        self.settingsStore = settingsStore
+        loadOverrides()
+    }
+    
+    public func loadOverrides() {
+        if let data = settingsStore.get(.actionCustomizations),
+           let document = try? SettingsDocument<[String: ActionOverride]>.decode(from: data) {
+            self.overrides = document.payload
+        } else {
+            self.overrides = [:]
+        }
+    }
+    
+    public func override(for actionID: String) -> ActionOverride? {
+        overrides[actionID]
+    }
+    
+    public func setOverride(for actionID: String, title: String?, symbol: String?, text: String?) {
+        var existing = overrides[actionID] ?? ActionOverride()
+        
+        let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        existing.customTitle = (trimmedTitle?.isEmpty == false) ? trimmedTitle : nil
+        
+        let trimmedSymbol = symbol?.trimmingCharacters(in: .whitespacesAndNewlines)
+        existing.customIconSymbol = (trimmedSymbol?.isEmpty == false) ? trimmedSymbol : nil
+        
+        let trimmedText = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        existing.customIconText = (trimmedText?.isEmpty == false) ? trimmedText : nil
+        
+        if existing.customTitle == nil
+            && existing.customIconSymbol == nil
+            && existing.customIconText == nil
+            && existing.deliveryPreference == nil {
+            overrides.removeValue(forKey: actionID)
+        } else {
+            overrides[actionID] = existing
+        }
+        
+        saveOverrides()
+    }
+
+    public func setDeliveryPreference(_ preference: ResultDeliveryPreference?, for actionID: String) {
+        var existing = overrides[actionID] ?? ActionOverride()
+        existing.deliveryPreference = preference
+
+        if existing.customTitle == nil
+            && existing.customIconSymbol == nil
+            && existing.customIconText == nil
+            && existing.deliveryPreference == nil {
+            overrides.removeValue(forKey: actionID)
+        } else {
+            overrides[actionID] = existing
+        }
+
+        saveOverrides()
+    }
+    
+    public func resetOverride(for actionID: String) {
+        overrides.removeValue(forKey: actionID)
+        saveOverrides()
+    }
+
+    /// Clears all user overrides and re-syncs from settings. Test-isolation hook so the shared
+    /// singleton does not leak customizations across test cases.
+    public func reset() {
+        overrides = [:]
+        saveOverrides()
+        loadOverrides()
+    }
+    
+    // MARK: - Centralized Presentation Resolvers
+
+    public func displayTitle(for action: any Action) -> String {
+        let ov = override(for: action.id)
+        if let customTitle = ov?.customTitle, !customTitle.isEmpty {
+            return customTitle
+        }
+        return action.title
+    }
+
+    public func popupIcon(for action: any Action) -> ActionIcon {
+        let ov = override(for: action.id)
+        if let text = ov?.customIconText, !text.isEmpty {
+            return .text(text)
+        }
+        if let symbol = ov?.customIconSymbol, !symbol.isEmpty {
+            return ActionIcon.resolve(from: symbol)
+        }
+        return action.icon
+    }
+
+    public func tableIcon(for action: any Action) -> ActionIcon {
+        let ov = override(for: action.id)
+        if let symbol = ov?.customIconSymbol, !symbol.isEmpty {
+            return ActionIcon.resolve(from: symbol)
+        }
+        if ActionIdentity.isAIPreset(action) {
+            return .symbol(Constants.defaultAIIconSymbol)
+        }
+        // `preferenceIconName` is an SF Symbol name. For builtins it is hand-written (Cut/Copy/Paste
+        // expose real symbols despite `.text` icons); for extension actions it is *derived* from the
+        // icon, and that derivation is only valid for `.symbol` icons — `.local` degrades to the
+        // filename (e.g. "snail.svg") and `.url` to the URL, neither a symbol. Swap in the preference
+        // symbol for `.symbol`/`.text` icons, keep the real icon for `.local`/`.url`.
+        if let configurable = action as? any ConfigurableAction {
+            switch action.icon {
+            case .symbol:
+                return .symbol(configurable.preferenceIconName)
+            case .text:
+                if ActionIdentity.isBuiltin(action) {
+                    return .symbol(configurable.preferenceIconName)
+                }
+                return action.icon
+            case .local, .url:
+                return action.icon
+            }
+        }
+        return action.icon
+    }
+
+    public func presented(_ action: any Action, surface: ActionPresentationSurface) -> ActionPresentationModel {
+        let title = displayTitle(for: action)
+        let icon: ActionIcon
+        switch surface {
+        case .popup:
+            icon = popupIcon(for: action)
+        case .table:
+            icon = tableIcon(for: action)
+        }
+        return ActionPresentationModel(title: title, icon: icon)
+    }
+
+    private func saveOverrides() {
+        if let encoded = try? SettingsDocument(payload: overrides).encoded() {
+            settingsStore.set(.actionCustomizations, value: encoded)
+        }
+    }
+}
+

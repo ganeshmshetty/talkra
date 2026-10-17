@@ -1,0 +1,132 @@
+name: Talkra
+options:
+  bundleIdPrefix: com.talkra
+  developmentLanguage: en
+  knownRegions: [en, Base, zh-Hans, zh-Hant, fr, ja]
+targets:
+  Core:
+    type: framework
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources: [Sources/Core]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: true
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+  Talkra:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources: [Sources/OpenClip]
+    info:
+      path: Sources/OpenClip/Info.plist
+      properties:
+        CFBundleURLTypes:
+          - CFBundleURLName: com.talkra.url
+            CFBundleURLSchemes:
+              - talkra
+              - talkra-dev
+              # Extension catalog install links (openclip://install) keep working.
+              - openclip
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Talkra Extension
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - com.openclip.extension
+            LSTypeIsPackage: true
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.openclip.extension
+            UTTypeDescription: OpenClip Extension
+            UTTypeConformsTo:
+              - com.apple.package
+              - public.composite-content
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - openclipext
+        LSUIElement: true
+        NSHumanReadableCopyright: "Copyright © 2026 Ganesh M and Talkra Contributors. AGPL-3.0 licensed."
+        NSMicrophoneUsageDescription: "Talkra listens only while you hold the push-to-talk shortcut."
+        NSSpeechRecognitionUsageDescription: "Talkra transcribes your push-to-talk commands on this Mac."
+        NSAppleEventsUsageDescription: "Talkra needs to control other apps to run your AppleScript actions and to paste results back into the app you were using."
+        SUFeedURL: https://github.com/ganeshmshetty/talkra/releases/latest/download/appcast.xml
+        SUPublicEDKey: JbyKx5LUkYkM+ovsJ1NPDR2W+1ptfdsu6b51KBsKhWo=
+        SUScheduledCheckInterval: 86400
+        # Off until Talkra publishes its own signed appcast.
+        SUEnableAutomaticChecks: false
+        SUAutomaticallyUpdate: false
+        CFBundleLocalizations:
+          - en
+          - zh-Hans
+          - zh-Hant
+          - fr
+          - ja
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        # Continues the OpenClip version line so extension `minOpenClipVersion` checks keep working.
+        MARKETING_VERSION: "2.0.0"
+        CURRENT_PROJECT_VERSION: "24"
+        INFOPLIST_KEY_CFBundleShortVersionString: $(MARKETING_VERSION)
+        INFOPLIST_KEY_CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Sources/OpenClip/OpenClip.entitlements
+        PRODUCT_NAME: Talkra
+        PRODUCT_MODULE_NAME: OpenClip
+        # Ad-hoc is the default so a clone builds and runs with no Apple Developer account.
+        # scripts/sign_artifact.sh overrides the identity for signed/notarized builds.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: true
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        SWIFT_EMIT_LOC_STRINGS: YES
+        LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.talkra.Talkra.dev
+          INFOPLIST_KEY_CFBundleDisplayName: Talkra Dev
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: com.talkra.Talkra
+          INFOPLIST_KEY_CFBundleDisplayName: Talkra
+    dependencies:
+      - target: Core
+      - package: OpenSelection
+      - package: KeyboardShortcuts
+      - package: SDWebImageSwiftUI
+      - package: SDWebImageSVGCoder
+      - package: Sparkle
+  OpenClipTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources: [Tests/OpenClipTests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+    dependencies:
+      - target: Talkra
+      - package: OpenSelection
+packages:
+  OpenSelection:
+    url: https://github.com/ganeshmshetty/OpenSelection.git
+    exactVersion: 2.16.0
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    from: 3.1.0
+  SDWebImageSwiftUI:
+    url: https://github.com/SDWebImage/SDWebImageSwiftUI
+    from: 3.0.0
+  SDWebImageSVGCoder:
+    url: https://github.com/SDWebImage/SDWebImageSVGCoder
+    from: 1.7.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.4

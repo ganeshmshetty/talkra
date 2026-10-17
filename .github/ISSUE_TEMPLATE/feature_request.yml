@@ -1,0 +1,40 @@
+name: Feature Request
+description: Suggest an idea, enhancement, or new native capability for Talkra.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search [existing issues](https://github.com/ganeshmshetty/talkra/issues) before submitting.
+        For ideas about a specific community extension, use the
+        [extension catalog's issue tracker](https://github.com/ganeshmshetty/openclip-extensions/issues).
+
+        Want to work on this? Mention it below or comment `/claim` after submitting. Claiming is optional.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that Talkra makes hard or impossible? Lead with the problem, not the solution.
+      placeholder: Every time I ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: What you have in mind
+      description: The behavior or UI you are imagining. Rough is fine.
+      placeholder: I would expect it to ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Examples, workarounds, or screenshots
+      description: Anything that helps explain your use case.
+      placeholder: Currently I use ...; here is an example of what would help.
+    validations:
+      required: false

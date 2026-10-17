@@ -1,0 +1,17 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="pill" x1="0" y1="340" x2="0" y2="684" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#705CFF"/><stop offset="1" stop-color="#3E3AE4"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="#EFEFF1"/>
+  <rect x="190" y="340" width="510" height="344" rx="120" fill="url(#pill)"/>
+  <rect x="290" y="477" width="36" height="70" rx="18" fill="white"/>
+  <rect x="356" y="437" width="36" height="150" rx="18" fill="white"/>
+  <rect x="422" y="402" width="36" height="220" rx="18" fill="white"/>
+  <rect x="488" y="437" width="36" height="150" rx="18" fill="white"/>
+  <rect x="554" y="477" width="36" height="70" rx="18" fill="white"/>
+  <rect x="608" y="250" width="64" height="524" rx="34" fill="#2D2D2F"/>
+  <rect x="514" y="212" width="252" height="84" rx="34" fill="#2D2D2F"/>
+  <rect x="514" y="728" width="252" height="84" rx="34" fill="#2D2D2F"/>
+</svg>

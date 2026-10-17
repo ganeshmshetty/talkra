@@ -1,0 +1,379 @@
+// DynamicActionConfigView.swift
+// OpenClip
+//
+// Dynamically constructs configuration form rows for extension options, reading and writing
+// values through the injected option store (KeychainActionOptionStore since Phase 7 — secrets
+// route to Keychain, non-secrets to SettingsStore). Rows for required-but-unset options are
+// highlighted with a red border + "Required" caption (surfaced via `missingOptionIDs`).
+// Formatted with macOS Inset Grouped horizontal alignment (label on left, control on right).
+import SwiftUI
+import Core
+
+@MainActor
+public struct DynamicActionConfigView: View {
+    let actionID: String
+    let options: [ExtensionOption]
+    let optionStore: any ActionOptionReading & ActionOptionWriting
+    var missingOptionIDs: Set<String> = []
+
+    public init(
+        actionID: String,
+        options: [ExtensionOption],
+        optionStore: any ActionOptionReading & ActionOptionWriting = SecretActionOptionStore(),
+        missingOptionIDs: Set<String> = []
+    ) {
+        self.actionID = actionID
+        self.options = options
+        self.optionStore = optionStore
+        self.missingOptionIDs = missingOptionIDs
+    }
+
+    public var body: some View {
+        ForEach(options, id: \.id) { option in
+            DynamicOptionRowView(
+                actionID: actionID,
+                option: option,
+                optionStore: optionStore,
+                missingOptionIDs: missingOptionIDs
+            )
+        }
+    }
+}
+
+@MainActor
+struct DynamicOptionRowView: View {
+    let actionID: String
+    let option: ExtensionOption
+    let optionStore: any ActionOptionReading & ActionOptionWriting
+    var missingOptionIDs: Set<String> = []
+
+    @State private var storedValue: String
+    @State private var isSecretRevealed = false
+
+    init(
+        actionID: String,
+        option: ExtensionOption,
+        optionStore: any ActionOptionReading & ActionOptionWriting,
+        missingOptionIDs: Set<String> = []
+    ) {
+        self.actionID = actionID
+        self.option = option
+        self.optionStore = optionStore
+        self.missingOptionIDs = missingOptionIDs
+        _storedValue = State(initialValue: optionStore.stringValue(actionID: actionID, option: option))
+    }
+
+    private var isMissing: Bool { missingOptionIDs.contains(option.identifier) }
+
+    private var binding: Binding<String> {
+        Binding(
+            get: { storedValue },
+            set: { newValue in
+                storedValue = newValue
+                optionStore.setStringValue(newValue, actionID: actionID, option: option)
+            }
+        )
+    }
+
+    var body: some View {
+        if isSearchURLOption {
+            SearchEngineURLOptionView(
+                actionID: actionID,
+                option: option,
+                optionStore: optionStore,
+                isMissing: isMissing
+            )
+        } else {
+            standardRowBody
+        }
+    }
+
+    /// Search action's `url` option gets a search-engine preset picker instead of a bare template field.
+    private var isSearchURLOption: Bool {
+        actionID == SearchAction().id && option.identifier == "url"
+    }
+
+    private func pasteFromClipboard(isSecret: Bool) {
+        guard let clipboardText = NSPasteboard.general.string(forType: .string) else { return }
+        let textToPaste = isSecret ? clipboardText.trimmingCharacters(in: .whitespacesAndNewlines) : clipboardText
+        guard !textToPaste.isEmpty else { return }
+        storedValue = textToPaste
+        optionStore.setStringValue(textToPaste, actionID: actionID, option: option)
+    }
+
+    private func clearField() {
+        storedValue = ""
+        optionStore.setStringValue("", actionID: actionID, option: option)
+    }
+
+    @ViewBuilder
+    private func contextMenuContent(isSecret: Bool) -> some View {
+        Button(String(localized: "Paste")) {
+            pasteFromClipboard(isSecret: isSecret)
+        }
+        if !storedValue.isEmpty {
+            Button(String(localized: "Copy")) {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(storedValue, forType: .string)
+            }
+            Divider()
+            Button(String(localized: "Clear")) {
+                clearField()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var secretInputField: some View {
+        HStack(spacing: 5) {
+            Group {
+                if isSecretRevealed {
+                    TextField("", text: binding, prompt: Text(option.label))
+                } else {
+                    SecureField("", text: binding, prompt: Text(option.label))
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            .labelsHidden()
+            .frame(maxWidth: 200)
+            .missingFieldHighlight(isMissing)
+            .contextMenu {
+                contextMenuContent(isSecret: true)
+            }
+
+            Button {
+                isSecretRevealed.toggle()
+            } label: {
+                Image(systemName: isSecretRevealed ? "eye.slash" : "eye")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isSecretRevealed ? String(localized: "Hide Secret") : String(localized: "Show Secret"))
+        }
+    }
+
+    @ViewBuilder
+    private func stringInputField(isSecret: Bool) -> some View {
+        TextField("", text: binding, prompt: Text(option.label))
+            .textFieldStyle(.roundedBorder)
+            .labelsHidden()
+            .frame(maxWidth: 200)
+            .missingFieldHighlight(isMissing)
+            .contextMenu {
+                contextMenuContent(isSecret: isSecret)
+            }
+    }
+
+    private var standardRowBody: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 6) {
+                Text(option.label)
+                    .font(.subheadline)
+                    .foregroundColor(.primary)
+
+                if isMissing {
+                    Text("Required")
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.red)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            switch option.type {
+            case .boolean:
+                Toggle("", isOn: Binding(
+                    get: { storedValue == "true" },
+                    set: {
+                        storedValue = $0 ? "true" : "false"
+                        optionStore.setStringValue($0 ? "true" : "false", actionID: actionID, option: option)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .missingFieldHighlight(isMissing)
+
+            case .multiple:
+                if let choices = option.options, !choices.isEmpty {
+                    Picker("", selection: binding) {
+                        ForEach(choices, id: \.self) { choice in
+                            Text(Self.choiceDisplayLabel(choice)).tag(choice)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .missingFieldHighlight(isMissing)
+                } else {
+                    stringInputField(isSecret: false)
+                }
+
+            case .secret:
+                secretInputField
+
+            case .string:
+                stringInputField(isSecret: false)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    static func choiceDisplayLabel(_ choice: String) -> String {
+        switch choice.lowercased() {
+        case "card": return String(localized: "Return meaning")
+        case "popover": return String(localized: "Show Look Up popover")
+        case "dictionary": return String(localized: "Open in Dictionary app")
+        case "native": return String(localized: "Native (Default .ics)")
+        case "busycal": return "BusyCal"
+        case "fantastical": return "Fantastical"
+        case "apple": return String(localized: "Apple Calendar")
+        case "google": return String(localized: "Google Calendar")
+        default:
+            // Preserve author-specified casing (e.g. "UTC", "USD", "12h", "CET").
+            // Only title-case letter-leading, all-lowercase slugs (e.g. "english" -> "English").
+            if choice.first?.isLetter == true, choice == choice.lowercased() {
+                return choice.capitalized
+            }
+            return choice
+        }
+    }
+}
+
+/// Search-engine preset picker for the built-in Search action's URL option; a `{query}` template stays reachable via "Custom...".
+/// Writes go through the injected option store, which stays the single source of truth.
+@MainActor
+private struct SearchEngineURLOptionView: View {
+    let actionID: String
+    let option: ExtensionOption
+    let optionStore: any ActionOptionReading & ActionOptionWriting
+    var isMissing: Bool
+
+    private enum SearchEngineSelection: Hashable {
+        case preset(String) // stable preset id
+        case custom
+    }
+
+    @State private var selection: SearchEngineSelection
+    @State private var customTemplate: String
+
+    init(
+        actionID: String,
+        option: ExtensionOption,
+        optionStore: any ActionOptionReading & ActionOptionWriting,
+        isMissing: Bool
+    ) {
+        self.actionID = actionID
+        self.option = option
+        self.optionStore = optionStore
+        self.isMissing = isMissing
+        let stored = optionStore.stringValue(actionID: actionID, option: option)
+        _selection = State(initialValue: Self.initialSelection(for: stored))
+        _customTemplate = State(initialValue: stored)
+    }
+
+    /// Preset only on exact match; hand-edited or self-hosted endpoints fall back to Custom and are never snapped back.
+    private static func initialSelection(for stored: String) -> SearchEngineSelection {
+        SearchEnginePreset.preset(matching: stored).map { .preset($0.id) } ?? .custom
+    }
+
+    private var pickerBinding: Binding<SearchEngineSelection> {
+        Binding(
+            get: { selection },
+            set: { newValue in
+                selection = newValue
+                if case .preset(let presetID) = newValue, let preset = SearchEnginePreset.preset(id: presetID) {
+                    customTemplate = preset.urlTemplate
+                    optionStore.setStringValue(preset.urlTemplate, actionID: actionID, option: option)
+                }
+            }
+        )
+    }
+
+    private var customTemplateBinding: Binding<String> {
+        Binding(
+            get: { customTemplate },
+            set: { newValue in
+                customTemplate = newValue
+                optionStore.setStringValue(newValue, actionID: actionID, option: option)
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                HStack(spacing: 6) {
+                    Text(option.label)
+                        .font(.subheadline)
+                        .foregroundColor(.primary)
+
+                    if isMissing {
+                        Text("Required")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.red)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                Picker("", selection: pickerBinding) {
+                    ForEach(SearchEnginePreset.all) { preset in
+                        Text(preset.displayName).tag(SearchEngineSelection.preset(preset.id))
+                    }
+                    Text(String(localized: "Custom...")).tag(SearchEngineSelection.custom)
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(maxWidth: 200)
+                .missingFieldHighlight(isMissing)
+            }
+
+            if selection == .custom {
+                TextField("https://example.com/search?q={query}", text: customTemplateBinding)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .missingFieldHighlight(isMissing)
+                    .contextMenu {
+                        Button(String(localized: "Paste")) {
+                            if let pasted = NSPasteboard.general.string(forType: .string) {
+                                customTemplate = pasted
+                                optionStore.setStringValue(pasted, actionID: actionID, option: option)
+                            }
+                        }
+                        if !customTemplate.isEmpty {
+                            Button(String(localized: "Copy")) {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(customTemplate, forType: .string)
+                            }
+                            Divider()
+                            Button(String(localized: "Clear")) {
+                                customTemplate = ""
+                                optionStore.setStringValue("", actionID: actionID, option: option)
+                            }
+                        }
+                    }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private extension View {
+    /// Emphasizes a required-but-unset option field with a red rounded border. No-op when not missing.
+    @ViewBuilder
+    func missingFieldHighlight(_ isMissing: Bool) -> some View {
+        if isMissing {
+            self
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color.red.opacity(0.7), lineWidth: 1)
+                )
+        } else {
+            self
+        }
+    }
+}

@@ -1,0 +1,373 @@
+import XCTest
+@testable import OpenClip
+
+@MainActor
+final class AIProviderTests: XCTestCase {
+
+    // MARK: - Apple Intelligence
+
+    func testAppleIntelligenceRejectsEmptyText() async {
+        let provider = AppleIntelligenceProvider()
+        do {
+            _ = try await provider.process(prompt: "Summarize", text: "   \n")
+            XCTFail("Expected emptyInput error")
+        } catch let error as AIError {
+            XCTAssertEqual(error, .emptyInput)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    // MARK: - Cloud API
+
+    func testCloudAPIRejectsMissingKey() async {
+        let provider = CloudAPIProvider(apiKey: "", model: "gpt-4o-mini")
+        do {
+            _ = try await provider.process(prompt: "Fix", text: "hello")
+            XCTFail("Expected missingAPIKey")
+        } catch let error as AIError {
+            XCTAssertEqual(error, .missingAPIKey)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    // MARK: - Local LLM
+
+    func testLocalLLMNormalizesEmptyBaseURLAndModel() {
+        let provider = LocalLLMProvider(baseURL: "", model: "  ")
+        XCTAssertEqual(provider.baseURL, "http://localhost:1234/v1")
+        XCTAssertEqual(provider.model, "default")
+    }
+
+    func testLocalLLMStripsTrailingSlash() {
+        let provider = LocalLLMProvider(baseURL: "http://localhost:1234/v1/", model: "default")
+        XCTAssertEqual(provider.baseURL, "http://localhost:1234/v1")
+    }
+
+    func testLocalLLMRejectsEmptyText() async {
+        let provider = LocalLLMProvider(baseURL: "http://localhost:1234/v1", model: "default")
+        do {
+            _ = try await provider.process(prompt: "Summarize", text: "\t")
+            XCTFail("Expected emptyInput")
+        } catch let error as AIError {
+            XCTAssertEqual(error, .emptyInput)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testOnlyOllamaPresetDisablesThinking() {
+        for preset in LocalLLMPreset.allCases {
+            XCTAssertEqual(preset.disablesThinking, preset == .ollama, preset.rawValue)
+        }
+    }
+
+    func testLocalLLMKeepsThinkingByDefault() {
+        XCTAssertFalse(LocalLLMProvider(baseURL: "http://localhost:1234/v1", model: "default").disableThinking)
+        XCTAssertTrue(LocalLLMProvider(baseURL: "http://localhost:11434/v1", model: "qwen3.5:4b", disableThinking: true).disableThinking)
+    }
+
+    func testChatRequestOmitsReasoningEffortByDefault() throws {
+        let body = OpenAIChatRequest(model: "m", messages: [.init(role: "user", content: "hi")], stream: true)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any])
+        XCTAssertNil(json["reasoning_effort"])
+        XCTAssertEqual(json["stream"] as? Bool, true)
+    }
+
+    func testChatRequestEncodesReasoningEffort() throws {
+        let body = OpenAIChatRequest(model: "m", messages: [.init(role: "user", content: "hi")], stream: true, reasoningEffort: "none")
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any])
+        XCTAssertEqual(json["reasoning_effort"] as? String, "none")
+        XCTAssertEqual(json["model"] as? String, "m")
+    }
+
+    // MARK: - CLI Provider
+
+    func testCLIProviderInitialization() {
+        let provider = CLIProvider(preset: .claude, customCommand: "", modelOverride: "sonnet")
+        XCTAssertEqual(provider.type, .cli)
+        XCTAssertEqual(provider.preset, .claude)
+        XCTAssertEqual(provider.modelOverride, "sonnet")
+    }
+
+    func testCLIPresetLoginCommandsAndModels() {
+        XCTAssertEqual(CLIPreset.claude.loginCommand, "claude auth login")
+        XCTAssertEqual(CLIPreset.codex.loginCommand, "codex")
+        XCTAssertEqual(CLIPreset.copilot.loginCommand, "gh auth login")
+        XCTAssertFalse(CLIPreset.claude.authHelpText.isEmpty)
+        XCTAssertTrue(CLIPreset.claude.defaultModels.contains("sonnet"))
+        XCTAssertTrue(CLIPreset.codex.defaultModels.contains("o3-mini"))
+    }
+
+    func testCLIPresetsDisableThinkingWhereSupported() {
+        XCTAssertEqual(CLIPreset.claude.thinkingDisabledEnvironment["MAX_THINKING_TOKENS"], "0")
+        XCTAssertEqual(CLIPreset.codex.thinkingDisabledArguments, ["-c", "model_reasoning_effort=none"])
+        XCTAssertTrue(CLIPreset.claude.thinkingDisabledArguments.isEmpty)
+        XCTAssertTrue(CLIPreset.codex.thinkingDisabledEnvironment.isEmpty)
+        for preset in [CLIPreset.copilot, .custom] {
+            XCTAssertTrue(preset.thinkingDisabledEnvironment.isEmpty, preset.rawValue)
+            XCTAssertTrue(preset.thinkingDisabledArguments.isEmpty, preset.rawValue)
+        }
+    }
+
+    func testEffectiveCLIModelResolution() {
+        let manager = AIServiceManager.shared
+        let previousCLIModel = manager.cliModel
+        let previousCLICustomModel = manager.cliCustomModel
+        defer {
+            manager.cliModel = previousCLIModel
+            manager.cliCustomModel = previousCLICustomModel
+        }
+
+        manager.cliModel = "default"
+        XCTAssertEqual(manager.effectiveCLIModel, "")
+
+        manager.cliModel = "sonnet"
+        XCTAssertEqual(manager.effectiveCLIModel, "sonnet")
+
+        manager.cliModel = "custom"
+        manager.cliCustomModel = "claude-3-7-sonnet-20250219"
+        XCTAssertEqual(manager.effectiveCLIModel, "claude-3-7-sonnet-20250219")
+    }
+
+    func testCLIProviderRejectsEmptyText() async {
+        let provider = CLIProvider(preset: .claude)
+        do {
+            _ = try await provider.process(prompt: "Summarize", text: "  ")
+            XCTFail("Expected emptyInput")
+        } catch let error as AIError {
+            XCTAssertEqual(error, .emptyInput)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    // MARK: - Manager
+
+    func testAIServiceManagerProviderTypes() {
+        let manager = AIServiceManager.shared
+        let previous = manager.activeProviderRaw
+        defer { manager.activeProviderRaw = previous }
+
+        // Pin availability: CI has no on-device model, and .apple would otherwise downgrade to .local.
+        // The downgrade itself is covered by testAppleIntelligenceSupportCheckAndUnsupportedFallback.
+        AppleIntelligenceAvailability.statusOverride = .available
+        defer { AppleIntelligenceAvailability.statusOverride = nil }
+
+        manager.activeProviderType = .apple
+        XCTAssertEqual(manager.currentProvider.type, .apple)
+
+        manager.activeProviderType = .local
+        XCTAssertEqual(manager.currentProvider.type, .local)
+
+        manager.activeProviderType = .cli
+        XCTAssertEqual(manager.currentProvider.type, .cli)
+
+        manager.activeProviderType = .cloud
+        XCTAssertEqual(manager.currentProvider.type, .cloud)
+    }
+
+    func testAIErrorDescriptionsArePresent() {
+        let errors: [AIError] = [
+            .emptyInput,
+            .missingAPIKey,
+            .invalidURL("bad"),
+            .invalidResponse,
+            .httpStatus(500, "boom"),
+            .httpStatus(404, nil),
+            .unsupportedModel("gemini"),
+            .providerUnavailable("Apple Intelligence is not available on this device"),
+            .requestTooLarge,
+            .cancelled
+        ]
+        for error in errors {
+            XCTAssertFalse(error.errorDescription?.isEmpty ?? true)
+        }
+    }
+
+    // MARK: - Extract Result & Reasoning Tags
+
+    func testExtractResultText() {
+        XCTAssertEqual(AIRequestSupport.extractResultText("<result>Clean text</result>"), "Clean text")
+        XCTAssertEqual(AIRequestSupport.extractResultText("<output>Clean output</output>"), "Clean output")
+        
+        // DeepSeek/reasoning <think> tag stripping
+        let thinkingOutput = "<think>Analyzing grammar and spelling...</think><result>Corrected sentence.</result>"
+        XCTAssertEqual(AIRequestSupport.extractResultText(thinkingOutput), "Corrected sentence.")
+
+        // Unclosed <think> during streaming should return empty to suppress raw thinking tokens
+        let partialThink = "<think>Analyzing user prompt..."
+        XCTAssertEqual(AIRequestSupport.extractResultText(partialThink), "")
+
+        // Unclosed <result> tag during streaming should return in-progress content
+        let partialResult = "<result>In progress streaming text"
+        XCTAssertEqual(AIRequestSupport.extractResultText(partialResult), "In progress streaming text")
+
+        // Empty closed tags should fall back to original text rather than returning closing tag
+        XCTAssertEqual(AIRequestSupport.extractResultText("<result></result>"), "<result></result>")
+        XCTAssertEqual(AIRequestSupport.extractResultText("<output>   </output>"), "<output>   </output>")
+
+        XCTAssertEqual(AIRequestSupport.extractResultText("Simple raw response"), "Simple raw response")
+
+        // Title tags are stripped from result text
+        let withTitle = "<title>Fix Spelling</title><result>Fixed text.</result>"
+        XCTAssertEqual(AIRequestSupport.extractResultText(withTitle), "Fixed text.")
+        XCTAssertEqual(AIRequestSupport.extractTitleText(withTitle), "Fix Spelling")
+
+        // Incomplete/unclosed <title> suppresses output until result starts
+        XCTAssertEqual(AIRequestSupport.extractResultText("<title>In progress title..."), "")
+        XCTAssertEqual(AIRequestSupport.extractTitleText("<title>In progress title..."), nil)
+    }
+
+    func testTitleSanitization() {
+        XCTAssertEqual(AIRequestSupport.extractTitleText("<title>  \"Clean Title\"  </title>"), "Clean Title")
+        XCTAssertEqual(AIRequestSupport.extractTitleText("<title>«French Translator»</title>"), "French Translator")
+        XCTAssertEqual(AIRequestSupport.extractTitleText("<title><title>Nested</title></title>"), "Nested")
+    }
+
+    func testCloudAPIEffectiveBaseURL() {
+        let defaultOpenAI = CloudAPIProvider(apiKey: "key", model: "gpt-4o", serviceProvider: .openai)
+        XCTAssertEqual(defaultOpenAI.effectiveBaseURL, "https://api.openai.com/v1")
+
+        let customAnthropic = CloudAPIProvider(apiKey: "key", model: "claude-3-5-sonnet", serviceProvider: .anthropic, customBaseURL: "https://my-proxy.internal/v1")
+        XCTAssertEqual(customAnthropic.effectiveBaseURL, "https://my-proxy.internal/v1")
+    }
+
+    func testSystemPromptAndUserContentFormatting() {
+        let customPrompt = "Translate into pirate English"
+        let systemPrompt = AIRequestSupport.systemPrompt(for: customPrompt)
+        XCTAssertTrue(systemPrompt.contains("Task:\nTranslate into pirate English"))
+        XCTAssertTrue(systemPrompt.contains("Return only the requested deliverable"))
+        XCTAssertTrue(systemPrompt.contains("<result>...</result>"))
+
+        let emptyTaskPrompt = AIRequestSupport.systemPrompt(for: "  ")
+        XCTAssertFalse(emptyTaskPrompt.contains("Task:"))
+
+        let userContent = AIRequestSupport.userContent(for: "Hello World")
+        XCTAssertEqual(userContent, "<text>\nHello World\n</text>")
+    }
+
+    // MARK: - Apple Intelligence availability
+
+    func testAppleIntelligenceAvailabilityMessagesAreActionable() {
+        let statuses: [AppleIntelligenceAvailability.Status] = [
+            .available, .unsupportedOS, .deviceNotEligible, .notEnabled, .modelNotReady, .unknown
+        ]
+        for status in statuses {
+            XCTAssertFalse(AppleIntelligenceAvailability.statusLabel(for: status).isEmpty)
+            XCTAssertFalse(AppleIntelligenceAvailability.unavailableExplanation(for: status).isEmpty)
+        }
+        XCTAssertTrue(AppleIntelligenceAvailability.Status.available.isAvailable)
+        XCTAssertFalse(AppleIntelligenceAvailability.Status.notEnabled.isAvailable)
+    }
+
+    func testAppleIntelligenceSupportCheckAndUnsupportedFallback() {
+        XCTAssertTrue(AppleIntelligenceAvailability.Status.available.isSupported)
+        XCTAssertTrue(AppleIntelligenceAvailability.Status.notEnabled.isSupported)
+        XCTAssertTrue(AppleIntelligenceAvailability.Status.modelNotReady.isSupported)
+        XCTAssertFalse(AppleIntelligenceAvailability.Status.unsupportedOS.isSupported)
+        XCTAssertFalse(AppleIntelligenceAvailability.Status.deviceNotEligible.isSupported)
+
+        // When device is not eligible (e.g. Intel or unsupported macOS):
+        AppleIntelligenceAvailability.statusOverride = .deviceNotEligible
+        defer { AppleIntelligenceAvailability.statusOverride = nil }
+
+        XCTAssertFalse(AppleIntelligenceAvailability.isSupported)
+        XCTAssertFalse(AIProviderType.supportedCases.contains(.apple))
+        XCTAssertEqual(AIProviderType.supportedCases, [.local, .cli, .cloud])
+
+        // AIServiceManager must fallback from .apple to .local on unsupported machines
+        AIServiceManager.shared.activeProviderRaw = "apple"
+        XCTAssertEqual(AIServiceManager.shared.activeProviderType, .local)
+    }
+
+    // MARK: - Structured output contract
+
+    func testStructuredSystemPromptDropsTagInstructions() {
+        let structured = AIRequestSupport.systemPrompt(for: "Summarize", structuredResult: true)
+        XCTAssertFalse(structured.contains("<result>...</result>"))
+        XCTAssertTrue(structured.contains("`result` field"))
+        XCTAssertTrue(structured.contains("Task:\nSummarize"))
+
+        let tagged = AIRequestSupport.systemPrompt(for: "Summarize", structuredResult: false)
+        XCTAssertTrue(tagged.contains("<result>...</result>"))
+    }
+
+    func testTaggedResponseRoundTripsThroughExtractors() {
+        let tagged = AIRequestSupport.taggedResponse(result: "Fixed text.", title: "Fix Spelling")
+        XCTAssertEqual(AIRequestSupport.extractResultText(tagged), "Fixed text.")
+        XCTAssertEqual(AIRequestSupport.extractTitleText(tagged), "Fix Spelling")
+
+        let resultOnly = AIRequestSupport.taggedResponse(result: "Only result")
+        XCTAssertEqual(AIRequestSupport.extractResultText(resultOnly), "Only result")
+        XCTAssertNil(AIRequestSupport.extractTitleText(resultOnly))
+
+        let blankTitle = AIRequestSupport.taggedResponse(result: "Body", title: "   ")
+        XCTAssertFalse(blankTitle.contains("<title>"))
+        XCTAssertEqual(AIRequestSupport.extractResultText(blankTitle), "Body")
+    }
+
+    func testTaggedResponseWithEmptyResultIsNotDetectableByExtractor() {
+        // Regression: an empty body falls back to the raw `<result></result>` wrapper, so the
+        // extractor cannot flag it. AppleIntelligenceProvider must check the typed field instead.
+        let empty = AIRequestSupport.taggedResponse(result: "")
+        XCTAssertEqual(empty, "<result></result>")
+        XCTAssertFalse(AIRequestSupport.extractResultText(empty).isEmpty)
+    }
+
+    func testTaggedResponseStripsLeakedTagMarkup() {
+        // Guided generation can echo tag markup from a text-shaped prompt into a field; it must not survive.
+        let leaked = AIRequestSupport.taggedResponse(
+            result: "<result>Fixed text.</result>",
+            title: "<title>Fix Spelling</title>"
+        )
+        XCTAssertEqual(AIRequestSupport.extractResultText(leaked), "Fixed text.")
+        XCTAssertEqual(AIRequestSupport.extractTitleText(leaked), "Fix Spelling")
+        XCTAssertFalse(leaked.contains("<title><title>"))
+    }
+
+    // MARK: - #43: cancellation must not read as clean completion
+
+    /// Lets the test cancel the producing task while the consumer stays subscribed.
+    private final class ProducerBox: @unchecked Sendable {
+        var task: Task<Void, Never>?
+    }
+
+    func testFinishStreamThrowsCancellationForCancelledTask() async {
+        let box = ProducerBox()
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            box.task = Task {
+                while !Task.isCancelled { await Task.yield() }
+                AIRequestSupport.finishStream(continuation)
+            }
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        box.task?.cancel()
+
+        do {
+            for try await _ in stream {}
+            XCTFail("A cancelled producer must throw CancellationError, not finish cleanly")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
+    func testFinishStreamCompletesCleanlyForLiveTask() async {
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            Task {
+                continuation.yield("chunk")
+                AIRequestSupport.finishStream(continuation)
+            }
+        }
+
+        var received: [String] = []
+        do {
+            for try await chunk in stream { received.append(chunk) }
+        } catch {
+            XCTFail("A live producer must finish cleanly, got \(error)")
+        }
+        XCTAssertEqual(received, ["chunk"])
+    }
+}

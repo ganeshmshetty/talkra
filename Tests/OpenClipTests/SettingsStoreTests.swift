@@ -1,0 +1,154 @@
+import XCTest
+@testable import Core
+@testable import OpenClip
+
+final class SettingsStoreTests: XCTestCase {
+    var userDefaults: UserDefaults!
+    var store: DefaultSettingsStore!
+
+    override func setUp() {
+        super.setUp()
+        userDefaults = UserDefaults(suiteName: #file)!
+        userDefaults.removePersistentDomain(forName: #file)
+        store = DefaultSettingsStore(userDefaults: userDefaults)
+    }
+
+    override func tearDown() {
+        userDefaults?.removePersistentDomain(forName: #file)
+        super.tearDown()
+    }
+
+    @MainActor
+    func testExtensionAutomaticUpdatesDefaultAndPersistence() async {
+        let settings = MemorySettingsStore()
+        let manager = ExtensionUpdateManager(settings: settings)
+        XCTAssertTrue(manager.automaticallyUpdatesExtensions)
+
+        manager.automaticallyUpdatesExtensions = false
+        XCTAssertFalse(settings.get(.automaticallyUpdatesExtensions))
+        let restored = ExtensionUpdateManager(settings: settings)
+        XCTAssertFalse(restored.automaticallyUpdatesExtensions)
+        await restored.performAutomaticUpdate()
+        XCTAssertFalse(restored.isChecking)
+        XCTAssertTrue(restored.updatablePackageIDs.isEmpty)
+
+        restored.automaticallyUpdatesExtensions = true
+        XCTAssertTrue(ExtensionUpdateManager(settings: settings).automaticallyUpdatesExtensions)
+    }
+
+    @MainActor
+    func testTypedSettingReadWrite() {
+        XCTAssertEqual(store.get(.actionOrder), [])
+        store.set(.actionOrder, value: ["builtin.copy", "builtin.paste"])
+        XCTAssertEqual(store.get(.actionOrder), ["builtin.copy", "builtin.paste"])
+    }
+
+    @MainActor
+    func testDisabledActionIDsDefault() {
+        XCTAssertTrue(store.get(.disabledActionIDs).isEmpty)
+        store.set(.disabledActionIDs, value: ["builtin.search"])
+        XCTAssertEqual(store.get(.disabledActionIDs), ["builtin.search"])
+    }
+
+    @MainActor
+    func testActionOptionKeyNameAndRoundTrip() {
+        let key = SettingKey.actionOption(actionID: "com.test.action", optionID: "prefix")
+        XCTAssertEqual(key.name, "action.com.test.action.option.prefix")
+        XCTAssertEqual(key.defaultValue, "")
+
+        XCTAssertEqual(store.get(key), "")
+        store.set(key, value: "hello")
+        XCTAssertEqual(store.get(key), "hello")
+        store.set(key, value: "")
+        XCTAssertEqual(store.get(key), "")
+    }
+
+    @MainActor
+    func testPopupScaleReadWrite() {
+        XCTAssertEqual(store.get(.popupScale), 3)
+        store.set(.popupScale, value: 4)
+        XCTAssertEqual(store.get(.popupScale), 4)
+    }
+
+    @MainActor
+    func testMenuBarIconVisibilityDefaultsToShownAndRoundTrips() {
+        XCTAssertTrue(store.get(.showMenuBarIcon))
+        store.set(.showMenuBarIcon, value: false)
+        XCTAssertFalse(store.get(.showMenuBarIcon))
+    }
+
+
+    // MARK: - Safe fallbacks (issue #21)
+
+    @MainActor
+    func testSetKeyWithUnexpectedStoredTypeReturnsDefault() {
+        // A non-array value stored under a Set<String> key must not crash — fall back to [].
+        userDefaults.set("not-an-array", forKey: SettingKey.disabledActionIDs.name)
+        XCTAssertEqual(store.get(.disabledActionIDs), [])
+
+        // An array of the wrong element type is not readable as [String] — fall back to [].
+        userDefaults.set([1, 2, 3], forKey: SettingKey.disabledPackages.name)
+        XCTAssertEqual(store.get(.disabledPackages), [])
+    }
+
+    @MainActor
+    func testSetKeyRoundTripStillWorks() {
+        store.set(.disabledActionIDs, value: ["builtin.search", "builtin.define"])
+        XCTAssertEqual(store.get(.disabledActionIDs), ["builtin.search", "builtin.define"])
+        store.set(.disabledActionIDs, value: [])
+        XCTAssertEqual(store.get(.disabledActionIDs), [])
+    }
+
+    @MainActor
+    func testOptionalDataKeyWithUnexpectedStoredTypeReturnsDefault() {
+        // A non-data value stored under a Data? key must not crash — fall back to nil.
+        userDefaults.set("not-data", forKey: SettingKey.actionGroups.name)
+        XCTAssertNil(store.get(.actionGroups))
+
+        userDefaults.set(42, forKey: SettingKey.actionCustomizations.name)
+        XCTAssertNil(store.get(.actionCustomizations))
+    }
+
+    @MainActor
+    func testOptionalDataKeyRoundTrip() {
+        // Unset key reads back the default (nil).
+        XCTAssertNil(store.get(.actionGroups))
+
+        let payload = "hello".data(using: .utf8)
+        store.set(.actionCustomizations, value: payload)
+        XCTAssertEqual(store.get(.actionCustomizations), payload)
+    }
+
+    func testResultDeliveryPreferenceMapping() {
+        XCTAssertEqual(ResultDeliveryPreference.allCases, [.preview, .paste, .copy])
+        XCTAssertEqual(ResultDeliveryPreference(rawValue: "preview"), .preview)
+        XCTAssertEqual(ResultDeliveryPreference(rawValue: "paste"), .paste)
+        XCTAssertEqual(ResultDeliveryPreference(rawValue: "copy"), .copy)
+        XCTAssertNil(ResultDeliveryPreference(rawValue: "bogus"))
+    }
+
+    // MARK: - Change-tracking metadata
+
+    @MainActor
+    func testMetadataAbsentUntilWrittenAndRecordsTimestamp() {
+        XCTAssertNil(store.metadata(for: .popupScale))
+
+        let before = Date()
+        store.set(.popupScale, value: 4)
+        let metadata = store.metadata(for: .popupScale)
+
+        XCTAssertEqual(metadata?.version, 1)
+        if let lastModified = metadata?.lastModified {
+            XCTAssertGreaterThanOrEqual(lastModified, before)
+        } else {
+            XCTFail("Expected metadata lastModified to be set after a write")
+        }
+    }
+
+    @MainActor
+    func testMetadataRecordsKeySchemaVersion() {
+        let key = SettingKey<String>("test.versioned", defaultValue: "", schemaVersion: 3)
+        store.set(key, value: "value")
+        XCTAssertEqual(store.metadata(for: key)?.version, 3)
+    }
+}

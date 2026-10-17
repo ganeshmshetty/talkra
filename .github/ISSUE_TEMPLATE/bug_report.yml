@@ -1,0 +1,104 @@
+name: Bug Report
+description: Report a bug, crash, or unexpected behavior in Talkra.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search [existing issues](https://github.com/ganeshmshetty/talkra/issues) before submitting.
+        For problems with a specific community extension, use the
+        [extension catalog's issue tracker](https://github.com/ganeshmshetty/openclip-extensions/issues).
+
+        Want to work on this? Mention it below or comment `/claim` after submitting. Claiming is optional.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: A clear and concise description of the problem.
+      placeholder: What went wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open [target app, e.g. Safari / Notes / VS Code]
+        2. Select the text "..."
+        3. Trigger the popup (or action search via Opt+Cmd+C)
+        4. Choose the action "..."
+        5. Observe: the popup never appears
+      description: If it happens intermittently or you cannot reproduce it reliably, say so here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: What you expected instead
+      placeholder: What should have happened?
+    validations:
+      required: false
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      description: Run `sw_vers` in Terminal, or check the Apple menu → About This Mac.
+      placeholder: e.g. 15.3, 14.7
+    validations:
+      required: true
+
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Chip architecture
+      options:
+        - Apple Silicon
+        - Intel (x86_64)
+        - Unsure
+    validations:
+      required: false
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Talkra version
+      description: Run `/Applications/Talkra.app/Contents/MacOS/Talkra --version`, or check the menu bar → About.
+      placeholder: e.g. 1.6.2
+    validations:
+      required: true
+
+  - type: input
+    id: target-app
+    attributes:
+      label: App you were working in
+      description: Which app had your text selected when this happened?
+      placeholder: e.g. Safari, Notes, VS Code, Terminal
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        You can export logs from Preferences → About and attach them here.
+        Screenshots and logs are optional; check attachments for sensitive information before sharing.
+      render: shell
+      placeholder: Paste the relevant lines here, or say "none available" if the app never launched.
+    validations:
+      required: false
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshot or screen recording
+      description: >-
+        Drag and drop an image or recording. The macOS recorder captures the whole screen, so
+        crop it to the popup.
+    validations:
+      required: false

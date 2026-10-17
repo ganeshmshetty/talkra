@@ -1,0 +1,640 @@
+// AIConfigureForm.swift
+// OpenClip
+//
+// Reusable AI engine + provider configuration form, shared by the AI preferences
+// tab and the first-launch onboarding flow so both surfaces expose the same settings.
+import SwiftUI
+import AppKit
+import Core
+
+@MainActor
+public struct AIConfigureForm: View {
+    /// `true` when the caller supplies the surrounding `Form` (AI preferences); `false` renders a self-contained form for onboarding.
+    private let embedded: Bool
+
+    @ObservedObject private var aiManager = AIServiceManager.shared
+
+    @State private var router: DecisionRouter = DecisionRouter.current
+    @State private var routerAccount: String = DefaultSettingsStore.shared.get(.aiRouterCloudflareAccount)
+    @State private var routerCloudflareModel: String = DefaultSettingsStore.shared.get(.aiRouterCloudflareModel)
+    @State private var routerCloudflareKey: String = SecretStore.get(account: DecisionRouter.cloudflareKeyAccount) ?? ""
+    @State private var routerLocalKey: String = SecretStore.get(account: DecisionRouter.localKeyAccount) ?? ""
+    @State private var routerLocalURL: String = DefaultSettingsStore.shared.get(.aiRouterLocalURL)
+    @State private var routerLocalModel: String = DefaultSettingsStore.shared.get(.aiRouterLocalModel)
+    @State private var jevKey: String = SecretStore.get(account: JevRouting.apiKeyAccount) ?? ""
+    @State private var fetchedCloudModels: [String] = []
+    @State private var isFetchingCloudModels: Bool = false
+    @State private var cloudFetchError: String? = nil
+    @State private var cloudFetchGeneration: Int = 0
+    @State private var cloudKeyDebounceTask: Task<Void, Never>?
+
+    @State private var fetchedLocalModels: [String] = []
+    @State private var isFetchingLocalModels: Bool = false
+    @State private var localFetchError: String? = nil
+    @State private var localFetchGeneration: Int = 0
+
+    @State private var fetchedCLIModels: [String] = []
+    @State private var isFetchingCLIModels: Bool = false
+
+    @State private var cliAuthStatus: (isAuthenticated: Bool, message: String)? = nil
+    @State private var isCheckingCLIAuth: Bool = false
+    /// Expanded state of the inline "how to authenticate" note.
+    @State private var showingAuthHelp: Bool = false
+
+    public init(embedded: Bool = false) {
+        self.embedded = embedded
+    }
+
+    public var body: some View {
+        if embedded {
+            sections
+        } else {
+            Form {
+                sections
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+        }
+    }
+
+    private func settingBinding(_ state: Binding<String>, _ key: SettingKey<String>) -> Binding<String> {
+        Binding(get: { state.wrappedValue }, set: { state.wrappedValue = $0; DefaultSettingsStore.shared.set(key, value: $0) })
+    }
+
+    private func secretBinding(_ state: Binding<String>, account: String) -> Binding<String> {
+        Binding(get: { state.wrappedValue }, set: { newValue in
+            state.wrappedValue = newValue
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { SecretStore.delete(account: account) } else { _ = SecretStore.set(trimmed, account: account) }
+        })
+    }
+
+    /// How well the selected provider handles voice routing and script writing.
+    private var voiceSuitabilityNote: some View {
+        let (symbol, tint, text): (String, Color, String) = switch aiManager.activeProviderType {
+        case .cloud:
+            ("checkmark.seal.fill", .green, String(localized: "Best for voice commands: fast, picks the right action and writes reliable scripts."))
+        case .cli:
+            ("checkmark.circle.fill", .green, String(localized: "Works well for voice commands, using your AI CLI subscription. Each command takes a few seconds longer."))
+        case .local:
+            ("exclamationmark.circle.fill", .orange, String(localized: "Voice commands need a capable local model (7B or larger). Small models may pick the wrong action or write broken scripts."))
+        case .apple:
+            ("exclamationmark.triangle.fill", .orange, String(localized: "Apple Intelligence handles rewrites and answers, but its small on-device model often misroutes voice commands and struggles to write scripts."))
+        }
+        return Label {
+            Text(text).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(tint)
+        }
+    }
+
+    @ViewBuilder
+    private var sections: some View {
+        Group {
+            Section(header: Text("Provider Settings")) {
+                Picker("Select a Provider", selection: Binding(
+                    get: { aiManager.activeProviderRaw },
+                    set: { newValue in
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                            aiManager.activeProviderRaw = newValue
+                        }
+                    }
+                )) {
+                    ForEach(availableProviders, id: \.1) { (label, value) in
+                        Text(label).tag(value)
+                    }
+                }
+
+                voiceSuitabilityNote
+
+                if AppleIntelligenceAvailability.isSupported && aiManager.activeProviderType == .apple {
+                    let status = AppleIntelligenceAvailability.current
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "applelogo")
+                                .font(.system(size: 14, weight: .medium))
+                            Text("Apple Intelligence")
+                                .font(.system(size: 13, weight: .medium))
+
+                            HStack(spacing: 6) {
+                                Image(systemName: status.isAvailable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundColor(status.isAvailable ? .green : .orange)
+                                Text(AppleIntelligenceAvailability.statusLabel(for: status))
+                                    .foregroundColor(status.isAvailable ? .secondary : .orange)
+                            }
+                            .font(.caption)
+                        }
+
+                        if !status.isAvailable {
+                            Text(AppleIntelligenceAvailability.unavailableExplanation(for: status))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                } else if aiManager.activeProviderType == .local {
+                    Picker("Server Type", selection: $aiManager.localPreset) {
+                        ForEach(LocalLLMPreset.allCases) { preset in
+                            Text(preset.displayName).tag(preset)
+                        }
+                    }
+                    .onChange(of: aiManager.localPreset) { _ in
+                        fetchLocalModels()
+                    }
+
+                    TextField("Server Endpoint", text: $aiManager.localURL, prompt: Text(aiManager.localPreset.defaultBaseURL))
+                        .textFieldStyle(.roundedBorder)
+
+                    HStack(spacing: 8) {
+                        Picker("Model", selection: $aiManager.localModel) {
+                            ForEach(resolvedLocalModels, id: \.self) { m in
+                                Text(modelDisplayName(m)).tag(m)
+                            }
+                            Text("Custom…").tag("custom")
+                        }
+
+                        Button(action: fetchLocalModels) {
+                            if isFetchingLocalModels {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Fetch loaded models from local server")
+                        .disabled(isFetchingLocalModels)
+                    }
+
+                    if aiManager.localModel == "custom" {
+                        TextField("Custom Model Name", text: $aiManager.localCustomModel, prompt: Text("e.g. qwen2.5-coder-7b-instruct"))
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    if let localFetchError {
+                        HStack(spacing: 4) {
+                            Text("Status:")
+                                .foregroundColor(.secondary)
+
+                            Text(localFetchError)
+                                .foregroundColor(.red)
+                        }
+                        .font(.caption)
+                        .padding(.vertical, 2)
+                    }
+                } else if aiManager.activeProviderType == .cli {
+                    Picker("CLI Tool", selection: $aiManager.cliPreset) {
+                        ForEach(CLIPreset.allCases) { preset in
+                            Text(preset.displayName).tag(preset)
+                        }
+                    }
+                    .onChange(of: aiManager.cliPreset) { _ in
+                        checkCLIAuth()
+                        fetchCLIModels()
+                    }
+
+                    HStack(spacing: 6) {
+                        Text("Status:")
+                            .foregroundColor(.secondary)
+
+                        if isCheckingCLIAuth {
+                            ProgressView().controlSize(.small)
+                            Text("Checking…")
+                                .foregroundColor(.secondary)
+                        } else if let status = cliAuthStatus {
+                            Image(systemName: status.isAuthenticated ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundColor(status.isAuthenticated ? .green : .orange)
+                            Text(status.message)
+                                .foregroundColor(status.isAuthenticated ? .primary : .orange)
+                        } else {
+                            ProgressView().controlSize(.small)
+                            Text("Checking…")
+                                .foregroundColor(.secondary)
+                        }
+
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                showingAuthHelp.toggle()
+                            }
+                        } label: {
+                            Image(systemName: showingAuthHelp ? "info.circle.fill" : "info.circle")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("How to authenticate")
+
+                        Spacer()
+
+                        Button(action: checkCLIAuth) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Re-check authentication status")
+                        .disabled(isCheckingCLIAuth)
+                    }
+                    .font(.caption)
+                    .padding(.vertical, 2)
+
+                    if showingAuthHelp {
+                        authHelpNote
+                    }
+
+                    if aiManager.cliPreset == .custom {
+                        TextField("Execution Command", text: $aiManager.cliCustomCommand, prompt: Text("e.g. llm -m claude-3-5-sonnet"))
+                            .textFieldStyle(.roundedBorder)
+
+                        TextField("Auth Check Command (Optional)", text: $aiManager.cliCustomAuthCommand, prompt: Text("e.g. llm models or test probe command"))
+                            .textFieldStyle(.roundedBorder)
+
+                        Text("Selected text will be piped to stdin with $OPENCLIP_PROMPT and $OPENCLIP_TEXT set.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        HStack(spacing: 8) {
+                            Picker("Model", selection: $aiManager.cliModel) {
+                                ForEach(resolvedCLIModels, id: \.self) { m in
+                                    Text(modelDisplayName(m)).tag(m)
+                                }
+                                Text("Custom…").tag("custom")
+                            }
+
+                            Button(action: fetchCLIModels) {
+                                if isFetchingCLIModels {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Detect available models from CLI")
+                            .disabled(isFetchingCLIModels)
+                        }
+
+                        if aiManager.cliModel == "custom" {
+                            TextField("Custom Model Identifier", text: $aiManager.cliCustomModel, prompt: Text("e.g. claude-3-7-sonnet-20250219 or o3-mini"))
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                } else if aiManager.activeProviderType == .cloud {
+                    Picker("Service Provider", selection: $aiManager.cloudServiceProvider) {
+                        ForEach(CloudServiceProvider.allCases) { provider in
+                            Text(provider.displayName).tag(provider)
+                        }
+                    }
+                    .onChange(of: aiManager.cloudServiceProvider) { _ in
+                        fetchCloudModels()
+                    }
+
+                    if aiManager.cloudServiceProvider == .custom {
+                        TextField("Base Endpoint URL", text: $aiManager.cloudCustomURL)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    if aiManager.cloudServiceProvider == .cloudflare {
+                        TextField("Account ID", text: $aiManager.cloudCustomURL, prompt: Text("Cloudflare account ID"))
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    SecureField("API Key", text: $aiManager.cloudAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: aiManager.cloudAPIKey) { newKey in
+                            cloudKeyDebounceTask?.cancel()
+                            let trimmed = newKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else {
+                                cloudFetchGeneration += 1
+                                isFetchingCloudModels = false
+                                fetchedCloudModels = []
+                                cloudFetchError = nil
+                                return
+                            }
+                            cloudKeyDebounceTask = Task {
+                                try? await Task.sleep(nanoseconds: 500_000_000)
+                                guard !Task.isCancelled else { return }
+                                guard aiManager.activeProviderType == .cloud else { return }
+                                fetchCloudModels()
+                            }
+                        }
+
+                    HStack(spacing: 8) {
+                        Picker("Model", selection: $aiManager.cloudModel) {
+                            ForEach(resolvedCloudModels, id: \.self) { m in
+                                Text(modelDisplayName(m)).tag(m)
+                            }
+                            Text("Custom…").tag("custom")
+                        }
+
+                        Button(action: fetchCloudModels) {
+                            if isFetchingCloudModels {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Fetch available models live from API")
+                        .disabled(aiManager.cloudAPIKey.isEmpty || isFetchingCloudModels)
+                    }
+
+                    if aiManager.cloudModel == "custom" {
+                        TextField("Custom Model Identifier", text: $aiManager.cloudCustomModel, prompt: Text("e.g. gpt-4o-2024-08-06 or claude-3-5-sonnet-latest"))
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    if let cloudFetchError {
+                        Text("Query failed: \(cloudFetchError)")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
+                }
+            }
+            .disabled(!aiManager.isAIEnabled)
+
+            Section(header: Text("Routing")) {
+                Picker("Decision model", selection: $router) {
+                    ForEach(DecisionRouter.allCases) { Text($0.displayName).tag($0) }
+                }
+                .onChange(of: router) { DefaultSettingsStore.shared.set(.aiRouter, value: $0.rawValue) }
+
+                switch router {
+                case .provider:
+                    EmptyView()
+                case .jev:
+                    SecureField("TypeSafe API Key", text: secretBinding($jevKey, account: JevRouting.apiKeyAccount))
+                        .textFieldStyle(.roundedBorder)
+                case .clef:
+                    TextField("Account ID", text: settingBinding($routerAccount, .aiRouterCloudflareAccount))
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("API Token", text: secretBinding($routerCloudflareKey, account: DecisionRouter.cloudflareKeyAccount))
+                        .textFieldStyle(.roundedBorder)
+                    Picker("Model", selection: settingBinding($routerCloudflareModel, .aiRouterCloudflareModel)) {
+                        ForEach(["@cf/cloudflare/clef-flash", "@cf/cloudflare/clef"], id: \.self) { Text($0).tag($0) }
+                    }
+                case .local:
+                    TextField("Server Endpoint", text: settingBinding($routerLocalURL, .aiRouterLocalURL))
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Model", text: settingBinding($routerLocalModel, .aiRouterLocalModel))
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("API Key (optional)", text: secretBinding($routerLocalKey, account: DecisionRouter.localKeyAccount))
+                        .textFieldStyle(.roundedBorder)
+                }
+                Text("A typed decision model (not a chat model) decides which action a spoken command runs. If it fails or is unsure, your AI provider decides. Rewrites and answers always use your provider.")
+                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
+            }
+            .disabled(!aiManager.isAIEnabled)
+        }
+        .onAppear {
+            if aiManager.activeProviderType == .cli {
+                checkCLIAuth()
+                fetchCLIModels()
+            } else if aiManager.activeProviderType == .local {
+                fetchLocalModels()
+            } else if aiManager.activeProviderType == .cloud && !aiManager.cloudAPIKey.isEmpty {
+                fetchCloudModels()
+            }
+        }
+        .onDisappear {
+            cloudKeyDebounceTask?.cancel()
+        }
+        .onChange(of: aiManager.activeProviderRaw) { newRaw in
+            cloudKeyDebounceTask?.cancel()
+            if newRaw == AIProviderType.cli.rawValue {
+                checkCLIAuth()
+                fetchCLIModels()
+            } else if newRaw == AIProviderType.local.rawValue {
+                fetchLocalModels()
+            } else if newRaw == AIProviderType.cloud.rawValue && !aiManager.cloudAPIKey.isEmpty {
+                fetchCloudModels()
+            }
+        }
+    }
+
+    /// Inline auth help that expands its own row rather than opening a popover.
+    private var authHelpNote: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(authHelpText)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if aiManager.cliPreset == .codex {
+                Button("Open Terminal") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
+                }
+                .controlSize(.small)
+            } else if !aiManager.cliPreset.loginCommand.isEmpty {
+                Button("Copy Terminal Command") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(aiManager.cliPreset.loginCommand, forType: .string)
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
+        )
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    // MARK: - Intelligent Model Resolution
+
+    private var resolvedLocalModels: [String] {
+        if fetchedLocalModels.isEmpty {
+            let primary = aiManager.localPreset.primaryModel
+            var list = ["default"]
+            if primary != "default" {
+                list.append(primary)
+            }
+            if !aiManager.localModel.isEmpty && aiManager.localModel != "custom" && !list.contains(aiManager.localModel) {
+                list.append(aiManager.localModel)
+            }
+            return list
+        } else {
+            var list = ["default"]
+            for m in fetchedLocalModels where m != "default" {
+                list.append(m)
+            }
+            return list
+        }
+    }
+
+    private var resolvedCLIModels: [String] {
+        if fetchedCLIModels.isEmpty {
+            let primary = CLIProvider.inspectConfiguredModel(for: aiManager.cliPreset) ?? aiManager.cliPreset.primaryModel
+            var list = ["default"]
+            if primary != "default" {
+                list.append(primary)
+            }
+            if !aiManager.cliModel.isEmpty && aiManager.cliModel != "custom" && !list.contains(aiManager.cliModel) {
+                list.append(aiManager.cliModel)
+            }
+            return list
+        } else {
+            var list = ["default"]
+            for m in fetchedCLIModels where m != "default" {
+                list.append(m)
+            }
+            return list
+        }
+    }
+
+    private var resolvedCloudModels: [String] {
+        if fetchedCloudModels.isEmpty {
+            let primary = aiManager.cloudServiceProvider.primaryModel
+            var list = ["default"]
+            if primary != "default" {
+                list.append(primary)
+            }
+            if !aiManager.cloudModel.isEmpty && aiManager.cloudModel != "custom" && !list.contains(aiManager.cloudModel) {
+                list.append(aiManager.cloudModel)
+            }
+            return list
+        } else {
+            var list = ["default"]
+            for m in fetchedCloudModels where m != "default" {
+                list.append(m)
+            }
+            return list
+        }
+    }
+
+    private func modelDisplayName(_ model: String) -> String {
+        if model == "default" {
+            return "Default"
+        }
+        return model
+    }
+
+    private var authHelpText: String {
+        if aiManager.cliPreset == .custom {
+            return "Custom CLI tools can authenticate via shell environment variables (e.g. API keys in ~/.zshrc), session credentials, or local execution without credentials. You can optionally specify an Auth Check Command to verify that your tool is ready."
+        }
+        return aiManager.cliPreset.authHelpText
+    }
+
+    // MARK: - Actions
+
+    private func checkCLIAuth() {
+        isCheckingCLIAuth = true
+        let preset = aiManager.cliPreset
+        let customCmd = aiManager.cliCustomCommand
+        let customAuthCmd = aiManager.cliCustomAuthCommand
+        Task {
+            let result = await CLIProvider.checkAuthStatus(for: preset, customCommand: customCmd, customAuthCommand: customAuthCmd)
+            await MainActor.run {
+                guard aiManager.cliPreset == preset else { return }
+                self.cliAuthStatus = result
+                self.isCheckingCLIAuth = false
+            }
+        }
+    }
+
+    private func fetchCLIModels() {
+        let preset = aiManager.cliPreset
+        isFetchingCLIModels = true
+        Task {
+            let models = (try? await CLIProvider.fetchAvailableModels(for: preset)) ?? []
+            await MainActor.run {
+                guard aiManager.cliPreset == preset else { return }
+                self.fetchedCLIModels = models
+                self.isFetchingCLIModels = false
+            }
+        }
+    }
+
+    private func fetchCloudModels() {
+        cloudFetchGeneration += 1
+        let currentGeneration = cloudFetchGeneration
+        let targetProvider = aiManager.cloudServiceProvider
+        let targetCustomURL = aiManager.cloudCustomURL
+        let targetAPIKey = aiManager.cloudAPIKey
+
+        isFetchingCloudModels = true
+        cloudFetchError = nil
+        Task {
+            do {
+                let models = try await CloudAPIProvider.fetchAvailableModels(
+                    apiKey: targetAPIKey,
+                    provider: targetProvider,
+                    customBaseURL: targetCustomURL
+                )
+                await MainActor.run {
+                    guard currentGeneration == self.cloudFetchGeneration,
+                          aiManager.cloudServiceProvider == targetProvider,
+                          aiManager.cloudCustomURL == targetCustomURL,
+                          aiManager.cloudAPIKey == targetAPIKey else {
+                        return
+                    }
+                    self.fetchedCloudModels = models
+                    self.isFetchingCloudModels = false
+                    if let first = models.first, !models.contains(aiManager.cloudModel), aiManager.cloudModel != "default", aiManager.cloudModel != "custom" {
+                        aiManager.cloudModel = first
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard currentGeneration == self.cloudFetchGeneration,
+                          aiManager.cloudServiceProvider == targetProvider,
+                          aiManager.cloudCustomURL == targetCustomURL,
+                          aiManager.cloudAPIKey == targetAPIKey else {
+                        return
+                    }
+                    self.cloudFetchError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.fetchedCloudModels = []
+                    self.isFetchingCloudModels = false
+                }
+            }
+        }
+    }
+
+    private func fetchLocalModels() {
+        localFetchGeneration += 1
+        let currentGeneration = localFetchGeneration
+        let targetURL = aiManager.localURL
+
+        isFetchingLocalModels = true
+        localFetchError = nil
+        Task {
+            do {
+                let models = try await LocalLLMProvider.fetchAvailableModels(baseURL: targetURL)
+                await MainActor.run {
+                    guard currentGeneration == self.localFetchGeneration,
+                          aiManager.localURL == targetURL else {
+                        return
+                    }
+                    self.fetchedLocalModels = models
+                    self.isFetchingLocalModels = false
+                    if let first = models.first, !models.contains(aiManager.localModel), aiManager.localModel != "default", aiManager.localModel != "custom" {
+                        aiManager.localModel = first
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard currentGeneration == self.localFetchGeneration,
+                          aiManager.localURL == targetURL else {
+                        return
+                    }
+                    self.localFetchError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.fetchedLocalModels = []
+                    self.isFetchingLocalModels = false
+                }
+            }
+        }
+    }
+
+    private var availableProviders: [(String, String)] {
+        AIProviderType.supportedCases.map { type in
+            let label: String
+            switch type {
+            case .apple: label = String(localized: "Apple")
+            case .local: label = String(localized: "Local")
+            case .cli: label = String(localized: "CLI")
+            case .cloud: label = String(localized: "Cloud")
+            }
+            return (label, type.rawValue)
+        }
+    }
+}
+

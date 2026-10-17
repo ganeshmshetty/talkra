@@ -1,0 +1,269 @@
+// ActionChrome.swift
+// OpenClip
+//
+// UI policy metadata for actions (badge, row style, popup behavior, source), so views read presentation rules without type checks or string matching.
+import Foundation
+
+public struct ActionChrome: Codable, Sendable, Equatable {
+    public enum Badge: Codable, Sendable, Equatable {
+        case none
+        case script
+        case url
+        case custom
+        case extensionPkg(String)
+
+        private enum CodingKeys: String, CodingKey {
+            case none
+            case script
+            case url
+            case custom
+            case extensionPkg
+            case _0
+        }
+
+        public init(from decoder: Decoder) throws {
+            if let container = try? decoder.singleValueContainer(),
+               let str = try? container.decode(String.self) {
+                switch str {
+                case "none": self = .none
+                case "script": self = .script
+                case "url": self = .url
+                case "custom": self = .custom
+                default:
+                    if str.hasPrefix("extensionPkg:") {
+                        self = .extensionPkg(String(str.dropFirst("extensionPkg:".count)))
+                    } else {
+                        self = .extensionPkg(str)
+                    }
+                }
+                return
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if container.allKeys.contains(.none) {
+                self = .none
+            } else if container.allKeys.contains(.script) {
+                self = .script
+            } else if container.allKeys.contains(.url) {
+                self = .url
+            } else if container.allKeys.contains(.custom) {
+                self = .custom
+            } else if container.allKeys.contains(.extensionPkg) {
+                if let nested = try? container.nestedContainer(keyedBy: CodingKeys.self, forKey: .extensionPkg) {
+                    let val = try nested.decode(String.self, forKey: ._0)
+                    self = .extensionPkg(val)
+                } else if let str = try? container.decode(String.self, forKey: .extensionPkg) {
+                    self = .extensionPkg(str)
+                } else {
+                    self = .none
+                }
+            } else {
+                self = .none
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            switch self {
+            case .none:
+                var container = encoder.singleValueContainer()
+                try container.encode("none")
+            case .script:
+                var container = encoder.singleValueContainer()
+                try container.encode("script")
+            case .url:
+                var container = encoder.singleValueContainer()
+                try container.encode("url")
+            case .custom:
+                var container = encoder.singleValueContainer()
+                try container.encode("custom")
+            case .extensionPkg(let name):
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                var nested = container.nestedContainer(keyedBy: CodingKeys.self, forKey: .extensionPkg)
+                try nested.encode(name, forKey: ._0)
+            }
+        }
+    }
+
+    public enum RowStyle: String, Codable, Sendable, Equatable {
+        case standard
+        case actionGroup
+    }
+
+    public enum PopupBehavior: String, Codable, Sendable, Equatable {
+        case perform
+        case showSubActions
+        case provideCompletions
+    }
+
+    public enum Source: Codable, Sendable, Equatable {
+        case builtin
+        case custom
+        case extensionPkg(packageID: String)
+        /// AI preset row. Reachable by voice and from Preferences → Actions; groups under `builtin.aiTools` unless placed standalone.
+        case ai
+
+        private enum CodingKeys: String, CodingKey {
+            case builtin
+            case custom
+            case extensionPkg
+            case ai
+            case packageID
+            case _0
+        }
+
+        public init(from decoder: Decoder) throws {
+            if let container = try? decoder.singleValueContainer(),
+               let str = try? container.decode(String.self) {
+                switch str {
+                case "builtin": self = .builtin
+                case "custom": self = .custom
+                case "ai": self = .ai
+                default:
+                    if str.hasPrefix("extensionPkg:") {
+                        self = .extensionPkg(packageID: String(str.dropFirst("extensionPkg:".count)))
+                    } else {
+                        self = .extensionPkg(packageID: str)
+                    }
+                }
+                return
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if container.allKeys.contains(.builtin) {
+                self = .builtin
+            } else if container.allKeys.contains(.custom) {
+                self = .custom
+            } else if container.allKeys.contains(.ai) {
+                self = .ai
+            } else if container.allKeys.contains(.extensionPkg) {
+                if let nested = try? container.nestedContainer(keyedBy: CodingKeys.self, forKey: .extensionPkg) {
+                    if let val = try? nested.decode(String.self, forKey: .packageID) {
+                        self = .extensionPkg(packageID: val)
+                    } else if let val = try? nested.decode(String.self, forKey: ._0) {
+                        self = .extensionPkg(packageID: val)
+                    } else {
+                        self = .builtin
+                    }
+                } else if let str = try? container.decode(String.self, forKey: .extensionPkg) {
+                    self = .extensionPkg(packageID: str)
+                } else {
+                    self = .builtin
+                }
+            } else {
+                self = .builtin
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            switch self {
+            case .builtin:
+                var container = encoder.singleValueContainer()
+                try container.encode("builtin")
+            case .custom:
+                var container = encoder.singleValueContainer()
+                try container.encode("custom")
+            case .ai:
+                var container = encoder.singleValueContainer()
+                try container.encode("ai")
+            case .extensionPkg(let packageID):
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                var nested = container.nestedContainer(keyedBy: CodingKeys.self, forKey: .extensionPkg)
+                try nested.encode(packageID, forKey: .packageID)
+            }
+        }
+    }
+
+    public let badge: Badge
+    public let rowStyle: RowStyle
+    public let popupBehavior: PopupBehavior
+    public let source: Source
+    /// True when the action reads or mutates the real text selection (e.g. Copy/Cut) and is
+    /// therefore unsafe when the text came from the clipboard rather than a live selection.
+    public let requiresLiveSelection: Bool
+    /// AI Tools launcher: its group holds the AI presets; never run via `perform` (excluded from
+    /// voice matching, per-action hotkeys, and the flat catalog).
+    public let launchesAI: Bool
+    /// Slow action: the popup hides and a spinner toast shows until the result lands.
+    public let showsLoading: Bool
+    /// Loading toast text when `showsLoading`; nil falls back to "Opening <title>…".
+    public let loadingMessage: String?
+    /// Manifest `inline` flag: promotes an unset `outputKind` to `.text`.
+    public let isInlineResult: Bool
+    public let outputKind: ActionOutputKind
+    /// Author-recommended delivery for uncommitted results.
+    public let recommendedResult: ActionResultDeliveryMode?
+
+    public init(
+        badge: Badge = .none,
+        rowStyle: RowStyle = .standard,
+        popupBehavior: PopupBehavior = .perform,
+        source: Source = .builtin,
+        requiresLiveSelection: Bool = false,
+        launchesAI: Bool = false,
+        showsLoading: Bool = false,
+        loadingMessage: String? = nil,
+        isInlineResult: Bool = false,
+        outputKind: ActionOutputKind = .none,
+        recommendedResult: ActionResultDeliveryMode? = nil
+    ) {
+        self.badge = badge
+        self.rowStyle = rowStyle
+        self.popupBehavior = popupBehavior
+        self.source = source
+        self.requiresLiveSelection = requiresLiveSelection
+        self.launchesAI = launchesAI
+        self.showsLoading = showsLoading
+        self.loadingMessage = loadingMessage
+        self.isInlineResult = isInlineResult
+        self.outputKind = (outputKind == .none && isInlineResult) ? .text : outputKind
+        self.recommendedResult = recommendedResult
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.badge = try container.decode(Badge.self, forKey: .badge)
+        self.rowStyle = try container.decode(RowStyle.self, forKey: .rowStyle)
+        self.popupBehavior = try container.decode(PopupBehavior.self, forKey: .popupBehavior)
+        self.source = try container.decode(Source.self, forKey: .source)
+        self.requiresLiveSelection = try container.decode(Bool.self, forKey: .requiresLiveSelection)
+        self.launchesAI = try container.decode(Bool.self, forKey: .launchesAI)
+        self.showsLoading = try container.decode(Bool.self, forKey: .showsLoading)
+        self.loadingMessage = try container.decodeIfPresent(String.self, forKey: .loadingMessage)
+        let inline = try container.decodeIfPresent(Bool.self, forKey: .isInlineResult) ?? false
+        self.isInlineResult = inline
+        let rawOutput = try? container.decodeIfPresent(String.self, forKey: .outputKind)
+        let decodedOutput = rawOutput.flatMap(ActionOutputKind.init(rawValue:)) ?? .none
+        self.outputKind = (decodedOutput == .none && inline) ? .text : decodedOutput
+        let rawResult = try? container.decodeIfPresent(String.self, forKey: .recommendedResult)
+        self.recommendedResult = rawResult.flatMap(ActionResultDeliveryMode.init(rawValue:))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(badge, forKey: .badge)
+        try container.encode(rowStyle, forKey: .rowStyle)
+        try container.encode(popupBehavior, forKey: .popupBehavior)
+        try container.encode(source, forKey: .source)
+        try container.encode(requiresLiveSelection, forKey: .requiresLiveSelection)
+        try container.encode(launchesAI, forKey: .launchesAI)
+        try container.encode(showsLoading, forKey: .showsLoading)
+        try container.encodeIfPresent(loadingMessage, forKey: .loadingMessage)
+        try container.encode(isInlineResult, forKey: .isInlineResult)
+        if outputKind != .none {
+            try container.encode(outputKind.rawValue, forKey: .outputKind)
+        }
+        try container.encodeIfPresent(recommendedResult?.rawValue, forKey: .recommendedResult)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case badge
+        case rowStyle
+        case popupBehavior
+        case source
+        case requiresLiveSelection
+        case launchesAI
+        case showsLoading
+        case loadingMessage
+        case isInlineResult
+        case outputKind
+        case recommendedResult
+    }
+}

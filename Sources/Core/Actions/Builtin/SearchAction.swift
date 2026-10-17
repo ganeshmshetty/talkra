@@ -1,0 +1,68 @@
+// SearchAction.swift
+// OpenClip
+//
+// Implements web search functionality by querying configurable search engine URL templates using selected text.
+import Foundation
+
+public struct SearchAction: ConfigurableAction {
+    public let id = "builtin.search"
+    public var title: String { String(localized: "Search") }
+    public let icon = ActionIcon.symbol("magnifyingglass")
+    public let preferenceIconName = "magnifyingglass"
+    
+    public var actionOptions: [ExtensionOption] {
+        [
+            ExtensionOption(
+                identifier: "url",
+                label: String(localized: "Search Engine URL Template"),
+                type: .string,
+                defaultValue: SearchEnginePreset.defaultURLTemplate
+            )
+        ]
+    }
+    
+    private let settingsStore: any SettingsStore
+
+    public init(settingsStore: any SettingsStore = DefaultSettingsStore.shared) {
+        self.settingsStore = settingsStore
+    }
+    
+    @MainActor
+    public func isEnabled(for context: ActionContext) -> Bool {
+        let text = context.selection.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !text.isEmpty
+    }
+    
+    @MainActor
+    public func perform(_ context: ActionContext) async throws -> ActionResult {
+        let query = context.selection.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetTemplate = resolveTemplate()
+
+        if let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: Constants.queryValueAllowed) {
+            let urlString = targetTemplate.contains("{query}") ?
+                targetTemplate.replacingOccurrences(of: "{query}", with: encodedQuery) :
+                "https://www.google.com/search?q=\(encodedQuery)"
+
+            if let url = URL(string: urlString) {
+                let sourceBundleID = context.selection.sourceApp.bundleIdentifier
+                if BrowserDetector.isBrowser(bundleIdentifier: sourceBundleID), let sourceBundleID {
+                    return .openURLInApp(url: url, appBundleIdentifier: sourceBundleID)
+                }
+                return .openURL(url)
+            }
+        }
+
+        return .failure(NSError(domain: Constants.actionErrorDomain, code: Constants.actionErrorCode, userInfo: nil))
+    }
+
+    /// Reads the `url` option this action declares in `actionOptions` (the key the
+    /// Preferences edit sheet writes), falling back to the legacy pre-option-store key,
+    /// then to Google. An empty stored value counts as unset.
+    private func resolveTemplate() -> String {
+        let configured = settingsStore.get(SettingKey.actionOption(actionID: id, optionID: "url"))
+        if !configured.isEmpty { return configured }
+        let legacy = settingsStore.get(.searchURL)
+        if !legacy.isEmpty { return legacy }
+        return SearchEnginePreset.defaultURLTemplate
+    }
+}

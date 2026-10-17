@@ -1,0 +1,684 @@
+// SettingsRouterTests.swift
+// OpenClipTests
+//
+// Settings window navigation: router path and history, sidebar search, installed-extension groups,
+// action settings locations, and per-page toolbar contents.
+
+import XCTest
+import Combine
+import SwiftUI
+@testable import Core
+@testable import OpenClip
+
+@MainActor
+final class SettingsRouterTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        TestIsolation.reset()
+    }
+
+    // MARK: - Path and history
+
+    func testStartsOnGeneralWithNowhereToGo() {
+        let router = SettingsRouter()
+        XCTAssertEqual(router.path, [.general])
+        XCTAssertEqual(router.sidebarPage, .general)
+        XCTAssertEqual(router.currentPage, .general)
+        XCTAssertFalse(router.canGoBack)
+        XCTAssertFalse(router.canGoForward)
+    }
+
+    func testSelectReplacesThePathAndRecordsEveryStep() {
+        let router = SettingsRouter()
+        router.select(.shortcuts)
+        router.push(.action(id: "builtin.search"))
+        router.select(.ai)
+
+        XCTAssertEqual(router.path, [.ai])
+        XCTAssertEqual(router.history, [[.general], [.shortcuts], [.shortcuts, .action(id: "builtin.search")], [.ai]])
+        XCTAssertTrue(router.canGoBack)
+        XCTAssertFalse(router.canGoForward)
+    }
+
+    func testPushDrillsInAndPopComesBackOut() {
+        let router = SettingsRouter()
+        router.select(.shortcuts)
+        router.push(.action(id: "a"))
+        XCTAssertEqual(router.path, [.shortcuts, .action(id: "a")])
+        XCTAssertEqual(router.sidebarPage, .shortcuts, "the sidebar keeps the page the editor was reached from")
+        XCTAssertEqual(router.currentPage, .action(id: "a"))
+
+        router.pop()
+        XCTAssertEqual(router.path, [.shortcuts])
+        XCTAssertEqual(router.history.last, [.shortcuts], "pop is a navigation of its own, so it is recorded")
+    }
+
+    func testPopOnASidebarPageIsANoOp() {
+        let router = SettingsRouter()
+        router.select(.store)
+        let before = router.history
+        router.pop()
+        XCTAssertEqual(router.path, [.store])
+        XCTAssertEqual(router.history, before)
+    }
+
+    func testPushingAPageAlreadyInThePathReturnsToItInsteadOfStacking() {
+        let router = SettingsRouter()
+        router.select(.shortcuts)
+        router.push(.action(id: "a"))
+        router.pushIconPicker(writingTo: .constant("bolt"))
+        XCTAssertEqual(router.path.count, 3)
+
+        router.push(.action(id: "a"))
+        XCTAssertEqual(router.path, [.shortcuts, .action(id: "a")])
+    }
+
+    func testBackAndForwardWalkTheHistory() {
+        let router = SettingsRouter()
+        router.select(.shortcuts)
+        router.push(.action(id: "a"))
+        router.select(.about)
+
+        router.goBack()
+        XCTAssertEqual(router.path, [.shortcuts, .action(id: "a")])
+        XCTAssertTrue(router.canGoForward)
+
+        router.goBack()
+        XCTAssertEqual(router.path, [.shortcuts])
+        router.goBack()
+        XCTAssertEqual(router.path, [.general])
+        XCTAssertFalse(router.canGoBack)
+        router.goBack()
+        XCTAssertEqual(router.path, [.general], "back at the start is a no-op")
+
+        router.goForward()
+        router.goForward()
+        router.goForward()
+        XCTAssertEqual(router.path, [.about])
+        XCTAssertFalse(router.canGoForward)
+        router.goForward()
+        XCTAssertEqual(router.path, [.about], "forward at the end is a no-op")
+    }
+
+    func testANewNavigationAfterGoingBackDropsTheForwardEntries() {
+        let router = SettingsRouter()
+        router.select(.store)
+        router.select(.about)
+        router.goBack()
+        XCTAssertTrue(router.canGoForward)
+
+        router.select(.shortcuts)
+        XCTAssertFalse(router.canGoForward)
+        XCTAssertEqual(router.history, [[.general], [.store], [.shortcuts]])
+    }
+
+    func testGeneralRevealRequestsRepeatOnTheSamePageAndIgnoreStaleClears() throws {
+        let router = SettingsRouter()
+        router.revealGeneralControl(GeneralSearchTarget.captureText)
+        let first = try XCTUnwrap(router.generalRevealRequest)
+        XCTAssertEqual(router.path, [.general])
+
+        router.revealGeneralControl(GeneralSearchTarget.captureText)
+        let second = try XCTUnwrap(router.generalRevealRequest)
+        XCTAssertNotEqual(first.id, second.id)
+        router.clearGeneralRevealRequest(first.id)
+        XCTAssertEqual(router.generalRevealRequest, second)
+
+        router.clearGeneralRevealRequest(second.id)
+        XCTAssertNil(router.generalRevealRequest)
+    }
+
+    func testShowingTheCurrentPathAgainRecordsNothing() {
+        let router = SettingsRouter()
+        router.select(.shortcuts)
+        router.select(.shortcuts)
+        router.show(path: [.shortcuts])
+        XCTAssertEqual(router.history, [[.general], [.shortcuts]])
+    }
+
+    func testSelectingTheSidebarPageWhileDrilledInReturnsToItsTop() {
+        let router = SettingsRouter()
+        router.select(.shortcuts)
+        router.push(.action(id: "a"))
+        router.select(.shortcuts)
+        XCTAssertEqual(router.path, [.shortcuts])
+    }
+
+    func testHistoryIsCapped() {
+        let router = SettingsRouter()
+        for step in 0..<(SettingsRouter.historyLimit + 40) {
+            router.select(step % 2 == 0 ? .shortcuts : .general)
+        }
+        XCTAssertEqual(router.history.count, SettingsRouter.historyLimit)
+        XCTAssertEqual(router.historyIndex, SettingsRouter.historyLimit - 1)
+        XCTAssertEqual(router.path, router.history.last)
+    }
+
+    func testOpenConfigurationOpensTheActionUnderActionsAndKeepsTheRequest() {
+        let router = SettingsRouter()
+        let action = StubAction(id: "com.example.tool.action.0", title: "Tool", chrome: Self.extensionChrome(package: "com.example.tool"))
+        let request = ConfigurationRequest(actionID: action.id, reason: "Needs a key", missingOptionIDs: ["apiKey"])
+
+        router.openConfiguration(for: action, request: request)
+
+        XCTAssertEqual(router.path, [.extensionPackage(id: "com.example.tool"), .action(id: action.id)],
+                       "an extension's command is configured under its extension")
+        XCTAssertEqual(router.configurationRequest(for: action.id), request)
+        router.clearConfigurationRequest(for: action.id)
+        XCTAssertNil(router.configurationRequest(for: action.id))
+    }
+
+    func testIconPickerKeepsTheBindingItWasHanded() {
+        let router = SettingsRouter()
+        var symbol = "bolt"
+        let binding = Binding(get: { symbol }, set: { symbol = $0 })
+        router.select(.shortcuts)
+        router.push(.action(id: "a"))
+        router.pushIconPicker(writingTo: binding)
+
+        guard case .iconPicker = router.currentPage else {
+            return XCTFail("expected the icon picker on top, got \(router.currentPage)")
+        }
+        router.iconTarget?.wrappedValue = "heart"
+        XCTAssertEqual(symbol, "heart")
+    }
+
+    func testNoticesComeAndGo() {
+        let router = SettingsRouter()
+        XCTAssertNil(router.notice)
+        router.notifyError(title: "Remove Failed", message: "Nope")
+        XCTAssertEqual(router.notice?.title, "Remove Failed")
+        XCTAssertEqual(router.notice?.style, .error)
+        router.dismissNotice()
+        XCTAssertNil(router.notice)
+    }
+
+    // MARK: - Sidebar search
+
+    func testSidebarRowMatchesTitleOrKeywordsAndNeedsEveryWord() {
+        let row = SettingsSidebarRow(page: .ai, title: "AI", keywords: ["model", "api key", "prompt"], tile: .symbol("sparkles", tint: .purple))
+        XCTAssertTrue(row.matches("ai"))
+        XCTAssertTrue(row.matches("API"), "case does not matter")
+        XCTAssertTrue(row.matches("key"))
+        XCTAssertTrue(row.matches("api prompt"), "every word can come from a different keyword")
+        XCTAssertFalse(row.matches("api hotkey"), "one word that matches nothing rules the row out")
+        XCTAssertFalse(row.matches("store"))
+        XCTAssertTrue(row.matches("   "), "a blank query matches everything")
+    }
+
+    func testSidebarFilterKeepsEverythingForABlankQueryAndOrder() {
+        let rows = SettingsPage.systemPages.map { SettingsSidebarRow(systemPage: $0) }
+        XCTAssertEqual(SettingsSidebarFilter.filter(rows, query: "").map(\.page), SettingsPage.systemPages)
+        XCTAssertEqual(SettingsSidebarFilter.filter(rows, query: "hotkey").map(\.page), [.general, .shortcuts])
+        XCTAssertEqual(SettingsSidebarFilter.filter(rows, query: "licence").map(\.page), [.about])
+    }
+
+    func testPreferencesSearchOnlyMatchesNamesAndExplicitAliases() {
+        let entries = [
+            PreferencesSearchEntry.page(id: "settings", title: "General", breadcrumb: "Settings", path: [.general]),
+            PreferencesSearchEntry.page(id: "extension", title: "Café Tools", breadcrumb: "Extensions · Coffee", aliases: ["brew"], path: [.extensionPackage(id: "cafe")], section: .actions),
+            PreferencesSearchEntry.page(id: "builtin", title: "Capture Text", breadcrumb: "Actions", path: [.builtinAction(id: "capture")], section: .actions),
+        ]
+        XCTAssertEqual(PreferencesSearch.results(in: entries, query: "  CAPTURE TEXT ").map(\.id), ["builtin"])
+        XCTAssertEqual(PreferencesSearch.results(in: entries, query: "cafe").map(\.id), ["extension"])
+        XCTAssertEqual(PreferencesSearch.results(in: entries, query: "brew").map(\.id), ["extension"])
+        XCTAssertTrue(PreferencesSearch.results(in: entries, query: "coffee").isEmpty)
+        XCTAssertTrue(PreferencesSearch.results(in: entries, query: "builtin").isEmpty)
+        XCTAssertTrue(PreferencesSearch.results(in: entries, query: "ocr").isEmpty)
+        XCTAssertTrue(PreferencesSearch.results(in: entries, query: "  \n").isEmpty)
+    }
+
+    func testShortQueriesOnlyMatchPrefixesAndLongerQueriesCanMatchWithinNames() {
+        let entry = PreferencesSearchEntry.page(id: "save", title: "Save Location", breadcrumb: "General", aliases: ["Downloads"], path: [.general])
+        XCTAssertEqual(PreferencesSearch.results(in: [entry], query: "sa").count, 1)
+        XCTAssertEqual(PreferencesSearch.results(in: [entry], query: "do").count, 1)
+        XCTAssertTrue(PreferencesSearch.results(in: [entry], query: "lo").isEmpty)
+        XCTAssertEqual(PreferencesSearch.results(in: [entry], query: "loc").count, 1)
+        XCTAssertEqual(PreferencesSearch.results(in: [entry], query: "location save").count, 1)
+    }
+
+    func testSearchReturnsOnlySixBestResults() {
+        var entries = (0..<12).map { number in
+            PreferencesSearchEntry.page(id: "copy-\(number)", title: "Copy Tool \(number)", breadcrumb: "Actions", path: [.action(id: "copy-\(number)")])
+        }
+        entries.append(.page(id: "exact", title: "Copy", breadcrumb: "Actions", path: [.builtinAction(id: "copy")]))
+        XCTAssertEqual(PreferencesSearch.results(in: entries, query: "copy").map(\.id), [
+            "exact", "copy-0", "copy-1", "copy-2", "copy-3", "copy-4"
+        ])
+    }
+
+    func testPreferencesSearchTypingPerformance() {
+        let entries = (0..<300).map { index in
+            PreferencesSearchEntry.page(
+                id: "action-\(index)", title: "Sample Action \(index)", breadcrumb: "Extensions › Tools",
+                aliases: ["save", "clipboard", "screenshot", "翻译", "検索", "saisie automatique"],
+                path: [.action(id: "action-\(index)")], section: .actions
+            )
+        }
+        let index = PreferencesSearch.Index(entries: entries)
+        measure {
+            for query in ["s", "sa", "sam", "samp", "sample"] {
+                XCTAssertEqual(index.results(query: query).count, 6)
+            }
+        }
+    }
+
+    func testSearchKeyboardSelectionClampsAndRecoversAfterResultsChange() {
+        let ids = ["first", "second", "store"]
+        XCTAssertEqual(PreferencesSearch.movedSelection(from: nil, in: ids, direction: 1), "first")
+        XCTAssertEqual(PreferencesSearch.movedSelection(from: "first", in: ids, direction: -1), "first")
+        XCTAssertEqual(PreferencesSearch.movedSelection(from: "first", in: ids, direction: 1), "second")
+        XCTAssertEqual(PreferencesSearch.movedSelection(from: "second", in: ids, direction: 1), "store")
+        XCTAssertEqual(PreferencesSearch.movedSelection(from: "store", in: ids, direction: 1), "store")
+        XCTAssertEqual(PreferencesSearch.movedSelection(from: "removed", in: ids, direction: -1), "first")
+        XCTAssertNil(PreferencesSearch.movedSelection(from: nil, in: [], direction: 1))
+    }
+
+    func testPreferencesSearchRankingKeepsNamesAndAliasesInOneStableOrder() {
+        let entries = [
+            PreferencesSearchEntry.page(id: "keyword", title: "Other Tool", breadcrumb: "Settings", aliases: ["café"], path: [.general]),
+            PreferencesSearchEntry.page(id: "prefix", title: "Cafe Tools", breadcrumb: "Settings", path: [.about]),
+            PreferencesSearchEntry.page(id: "exact", title: "Café", breadcrumb: "Settings", path: [.store]),
+            PreferencesSearchEntry.page(id: "keyword-2", title: "Another", breadcrumb: "Settings", aliases: ["cafe"], path: [.ai]),
+        ]
+
+        XCTAssertEqual(PreferencesSearch.results(in: entries, query: "cafe").map(\.id), [
+            "exact", "keyword", "keyword-2", "prefix"
+        ])
+    }
+
+    func testPreferencesSearchDeduplicatesSameDestinationAndTitleAndKeepsGeneralTarget() {
+        let destination = PreferencesSearchEntry.page(
+            id: "action",
+            title: "Translate",
+            breadcrumb: "Extensions · Language Tools",
+            aliases: ["translate"],
+            path: [.extensionPackage(id: "language-tools"), .action(id: "translate")],
+            section: .actions
+        )
+        let duplicate = PreferencesSearchEntry.page(
+            id: "duplicate",
+            title: "Translate",
+            breadcrumb: "Extensions",
+            aliases: ["translate", "language"],
+            path: [.extensionPackage(id: "language-tools"), .action(id: "translate")],
+            section: .actions
+        )
+        let generalControl = PreferencesSearchEntry.generalControl(
+            id: GeneralSearchTarget.accessibilityAccess,
+            title: "Accessibility Access",
+            aliases: ["permission"]
+        )
+
+        let results = PreferencesSearch.results(in: [destination, duplicate, generalControl], query: "translate")
+        XCTAssertEqual(results.map(\.id), ["action"])
+        XCTAssertEqual(results[0].target, .page([.extensionPackage(id: "language-tools"), .action(id: "translate")]))
+        XCTAssertEqual(generalControl.target, .generalControl(id: "general.accessibilityAccess"))
+        XCTAssertEqual(GeneralSearchTarget.all.count, 7)
+        XCTAssertEqual(Set(GeneralSearchTarget.all).count, GeneralSearchTarget.all.count)
+    }
+
+    func testTheSidebarListsWhatShippedBeforeWhatWasInstalled() {
+        // Deliberately shuffled, and with names that would interleave under a plain A-Z sort.
+        let rows = [
+            SettingsSidebarRow(page: .extensionPackage(id: "com.a.appwrite"), title: "Appwrite", tile: .symbol("puzzlepiece.extension.fill", tint: .gray)),
+            SettingsSidebarRow(page: .builtinAction(id: "builtin.paste"), title: "Paste", tile: .symbol("bolt.fill", tint: .gray)),
+            SettingsSidebarRow(page: .customActions, title: "Custom Actions", tile: .symbol("plus", tint: .mint)),
+            SettingsSidebarRow(page: .extensionPackage(id: "com.z.jwt"), title: "JWT", tile: .symbol("puzzlepiece.extension.fill", tint: .gray)),
+            SettingsSidebarRow(page: .builtinAction(id: "builtin.copy"), title: "Copy", tile: .symbol("bolt.fill", tint: .gray)),
+            SettingsSidebarRow(systemPage: .ai),
+        ]
+
+        XCTAssertEqual(SettingsSidebarOrder.sorted(rows).map(\.title), [
+            "AI",              // OpenClip's own, first
+            "Copy", "Paste",   // then the built-in actions, alphabetically
+            "Custom Actions",  // then what the user wrote here
+            "Appwrite", "JWT", // then what the user installed, alphabetically
+        ])
+    }
+
+    func testTheSecondGroupSplitsWhereTheTintChanges() {
+        let rows = SettingsSidebarOrder.sorted([
+            SettingsSidebarRow(page: .extensionPackage(id: "com.a.appwrite"), title: "Appwrite", tile: .symbol("puzzlepiece.extension.fill", tint: .gray)),
+            SettingsSidebarRow(page: .builtinAction(id: "builtin.copy"), title: "Copy", tile: .symbol("bolt.fill", tint: .gray)),
+            SettingsSidebarRow(page: .customActions, title: "Custom Actions", tile: .symbol("plus", tint: .mint)),
+            SettingsSidebarRow(page: .extensionPackage(id: "com.z.jwt"), title: "JWT", tile: .symbol("puzzlepiece.extension.fill", tint: .gray)),
+            SettingsSidebarRow(systemPage: .ai),
+        ])
+
+        let (bundled, installed) = SettingsSidebarOrder.split(rows)
+        XCTAssertEqual(bundled.map(\.title), ["AI", "Copy", "Custom Actions"],
+                       "everything OpenClip ships stays above the gap, in its sorted order")
+        XCTAssertEqual(installed.map(\.title), ["Appwrite", "JWT"],
+                       "only installed packages sit below it")
+    }
+
+    func testSplittingASidebarWithNothingInstalledLeavesTheSecondSectionEmpty() {
+        let rows = [
+            SettingsSidebarRow(systemPage: .ai),
+            SettingsSidebarRow(page: .customActions, title: "Custom Actions", tile: .symbol("plus", tint: .mint)),
+        ]
+
+        let (bundled, installed) = SettingsSidebarOrder.split(rows)
+        XCTAssertEqual(bundled.count, 2)
+        XCTAssertTrue(installed.isEmpty, "no trailing gap when nothing is installed")
+    }
+
+    func testTheSidebarOrderIsStableForRowsOfTheSameKind() {
+        let rows = [
+            SettingsSidebarRow(page: .extensionPackage(id: "b"), title: "Übersicht", tile: .symbol("x", tint: .gray)),
+            SettingsSidebarRow(page: .extensionPackage(id: "a"), title: "Alpha", tile: .symbol("x", tint: .gray)),
+            SettingsSidebarRow(page: .extensionPackage(id: "c"), title: "alpha two", tile: .symbol("x", tint: .gray)),
+        ]
+        XCTAssertEqual(SettingsSidebarOrder.sorted(rows).map(\.title), ["Alpha", "alpha two", "Übersicht"],
+                       "names sort the way the Finder sorts them, not by code point")
+    }
+
+    // MARK: - Installed extensions
+
+    func testInstalledExtensionsGroupByPackageSortByNameAndSkipWhatIsNotAnExtension() {
+        let actions: [any Action] = [
+            StubAction(id: "builtin.copy", title: "Copy", chrome: ActionChrome(badge: .none, rowStyle: .standard, popupBehavior: .perform, source: .builtin)),
+            StubAction(id: "com.zeta.one.action.0", title: "Zeta", chrome: Self.extensionChrome(package: "com.zeta.one", badgeName: "Zeta")),
+            StubAction(id: "com.alpha.two.action.0", title: "Alpha A", chrome: Self.extensionChrome(package: "com.alpha.two", badgeName: "Alpha")),
+            StubAction(id: "com.alpha.two.action.1", title: "Alpha B", chrome: Self.extensionChrome(package: "com.alpha.two", badgeName: "Alpha")),
+            StubAction(id: "custom.abc123", title: "My snippet", chrome: Self.extensionChrome(package: "custom.abc123", badgeName: "My snippet")),
+            StubAction(id: "com.custom.legacy", title: "Legacy", chrome: Self.extensionChrome(package: "com.custom.legacy", badgeName: "Legacy")),
+            StubAction(id: "ai.proofread", title: "Proofread", chrome: ActionChrome(badge: .none, rowStyle: .standard, popupBehavior: .perform, source: .ai)),
+        ]
+
+        let infos = InstalledExtensionInfo.all(from: actions)
+        XCTAssertEqual(infos.map(\.packageID), ["com.alpha.two", "com.zeta.one"])
+        XCTAssertEqual(infos.map(\.name), ["Alpha", "Zeta"])
+        XCTAssertEqual(infos[0].commands.map(\.id), ["com.alpha.two.action.0", "com.alpha.two.action.1"])
+        XCTAssertNil(infos[0].containerActionID)
+        XCTAssertNil(infos[0].gatedReason)
+        XCTAssertTrue(InstalledExtensionInfo.isCustomPackage("custom.abc123"))
+        XCTAssertTrue(InstalledExtensionInfo.isCustomPackage("com.custom.legacy"))
+        XCTAssertFalse(InstalledExtensionInfo.isCustomPackage("com.openclip.jwt"))
+    }
+
+    func testAGroupPackageSeparatesItsContainerFromItsCommands() throws {
+        let package = "com.openclip.jwt"
+        let actions: [any Action] = [
+            StubAction(id: "\(package).jwt", title: "JWT", chrome: Self.extensionChrome(package: package, badgeName: "JWT", popupBehavior: .showSubActions)),
+            StubAction(id: "\(package).jwt.inspect", title: "Inspect", chrome: Self.extensionChrome(package: package, badgeName: "JWT")),
+            StubAction(id: "\(package).jwt.verify", title: "Verify Signature", chrome: Self.extensionChrome(package: package, badgeName: "JWT")),
+        ]
+
+        let info = try XCTUnwrap(InstalledExtensionInfo.info(for: package, in: actions))
+        XCTAssertEqual(info.name, "JWT")
+        XCTAssertTrue(info.isGroup)
+        XCTAssertEqual(info.containerActionID, "\(package).jwt")
+        XCTAssertEqual(info.commands.map(\.id), ["\(package).jwt.inspect", "\(package).jwt.verify"])
+        XCTAssertEqual(info.uninstallActionID, "\(package).jwt")
+        XCTAssertNil(InstalledExtensionInfo.info(for: "com.nowhere", in: actions))
+    }
+
+    func testAOneCommandPackageIsStillAnExtensionWithItsOneCommand() throws {
+        // A package with one top-level action still gets an extension page with one row.
+        let package = "com.openclip.shortenlink"
+        let action = StubAction(
+            id: "\(package).action.0",
+            title: "Shorten Link",
+            chrome: Self.extensionChrome(package: package, badgeName: "Shorten Link")
+        )
+
+        let info = try XCTUnwrap(InstalledExtensionInfo.info(for: package, in: [action]))
+        XCTAssertEqual(info.name, "Shorten Link")
+        XCTAssertFalse(info.isGroup, "no group container, so nothing to rename in the popup bar")
+        XCTAssertNil(info.containerActionID)
+        XCTAssertEqual(info.commands.map(\.id), [action.id], "its one command is listed like any other")
+        XCTAssertEqual(info.uninstallActionID, action.id, "and it is what the uninstall matches on")
+
+        XCTAssertEqual(InstalledExtensionInfo.all(from: [action]).map(\.packageID), [package])
+        XCTAssertEqual(SettingsDestination.path(for: action),
+                       [.extensionPackage(id: package), .action(id: action.id)],
+                       "opening the command keeps its extension's page one step back")
+    }
+
+    func testAGatedPackageReportsItsReasonAndHidesThePlaceholder() throws {
+        let package = "com.example.gated"
+        let gated = GatedExtensionAction(
+            packageID: package,
+            title: "Gated",
+            icon: .symbol("lock"),
+            chrome: Self.extensionChrome(package: package, badgeName: "Gated"),
+            reason: .filesChanged
+        )
+        let info = try XCTUnwrap(InstalledExtensionInfo.info(for: package, in: [gated]))
+        XCTAssertEqual(info.gatedReason, .filesChanged)
+        XCTAssertTrue(info.commands.isEmpty, "the trust gate's placeholder is not something to configure")
+        XCTAssertEqual(info.uninstallActionID, package)
+        XCTAssertNotNil(extensionGateDescription(for: .filesChanged))
+        XCTAssertNil(extensionGateDescription(for: .revoked), "a revoked package is explained by its switch being off")
+    }
+
+    // MARK: - Where an action's settings live
+
+    func testEveryKindOfActionHasOneHome() {
+        let builtin = StubAction(id: "builtin.copy", title: "Copy", chrome: ActionChrome(badge: .none, rowStyle: .standard, popupBehavior: .perform, source: .builtin))
+        XCTAssertEqual(SettingsDestination.path(for: builtin), [.builtinAction(id: "builtin.copy")], "a built-in is a sidebar row of its own")
+
+        let group = StubAction(id: "com.openclip.jwt.jwt", title: "JWT", chrome: Self.extensionChrome(package: "com.openclip.jwt", badgeName: "JWT", popupBehavior: .showSubActions))
+        XCTAssertEqual(SettingsDestination.path(for: group), [.extensionPackage(id: "com.openclip.jwt")], "an extension's group row is the extension")
+
+        let command = StubAction(id: "com.openclip.jwt.jwt.inspect", title: "Inspect", chrome: Self.extensionChrome(package: "com.openclip.jwt", badgeName: "JWT"))
+        XCTAssertEqual(SettingsDestination.path(for: command), [.extensionPackage(id: "com.openclip.jwt"), .action(id: command.id)], "a command sits under its extension")
+
+        let custom = StubAction(id: "custom.abc123", title: "Mine", chrome: ActionChrome(badge: .custom, rowStyle: .standard, popupBehavior: .perform, source: .custom))
+        XCTAssertEqual(SettingsDestination.path(for: custom), [.customActions, .action(id: "custom.abc123")])
+        XCTAssertTrue(SettingsDestination.isCustomAction(custom))
+
+        let manifestBackedCustom = StubAction(id: "custom.def456", title: "Snippet", chrome: Self.extensionChrome(package: "custom.def456", badgeName: "Snippet"))
+        XCTAssertEqual(SettingsDestination.path(for: manifestBackedCustom), [.customActions, .action(id: "custom.def456")], "a custom action stored as a manifest package is still the user's action")
+        XCTAssertTrue(SettingsDestination.isCustomAction(manifestBackedCustom))
+
+        let customGroup = StubAction(id: "vgroup.abc", title: "My Group", chrome: ActionChrome(badge: .none, rowStyle: .actionGroup, popupBehavior: .showSubActions, source: .custom))
+        XCTAssertEqual(SettingsDestination.path(for: customGroup), [.shortcuts, .action(id: "vgroup.abc")], "a group's page sits under the actions list")
+        XCTAssertFalse(SettingsDestination.isCustomAction(customGroup))
+
+        let gated = GatedExtensionAction(packageID: "com.example.gated", title: "Gated", icon: .symbol("lock"), chrome: Self.extensionChrome(package: "com.example.gated"), reason: .notEnabled)
+        XCTAssertEqual(SettingsDestination.path(for: gated), [.extensionPackage(id: "com.example.gated")])
+
+        XCTAssertEqual(SettingsDestination.path(forPackage: "com.example.multi"), [.extensionPackage(id: "com.example.multi")])
+    }
+
+    // MARK: - Toolbar accessories
+
+    func testExtensionMenuOffersReadmeAndFinderOnlyWhenTheyExist() {
+        let full = SettingsToolbarAccessories.extensionMenuItems(.init(hasReadme: true, hasFolder: true))
+        XCTAssertEqual(full.map(\.id), [
+            SettingsToolbarCommand.extensionReadme,
+            SettingsToolbarCommand.extensionFinder,
+            "extension.separator",
+            SettingsToolbarCommand.extensionUninstall,
+        ])
+        XCTAssertEqual(full.last?.role, .destructive, "uninstall is the red one")
+
+        let noReadme = SettingsToolbarAccessories.extensionMenuItems(.init(hasReadme: false, hasFolder: true))
+        XCTAssertEqual(noReadme.map(\.id), [
+            SettingsToolbarCommand.extensionFinder,
+            "extension.separator",
+            SettingsToolbarCommand.extensionUninstall,
+        ])
+
+        let bare = SettingsToolbarAccessories.extensionMenuItems(.init(hasReadme: false, hasFolder: false))
+        XCTAssertEqual(bare.map(\.id), [SettingsToolbarCommand.extensionUninstall],
+                       "no separator when there is nothing above it")
+        XCTAssertFalse(bare.contains { $0.isSeparator })
+    }
+
+    func testStoreMenuHoldsInstallAndRefreshAndGreysRefreshWhileItRuns() throws {
+        let idle = SettingsToolbarAccessories.storeMenuItems(isRefreshing: false)
+        XCTAssertEqual(idle.map(\.id), [
+            SettingsToolbarCommand.storeInstallFile,
+            SettingsToolbarCommand.storeRefresh,
+        ], "installing a package from disk belongs to the Store, not to Customize")
+        XCTAssertTrue(idle.allSatisfy(\.isEnabled))
+        XCTAssertFalse(idle.contains { $0.role == .destructive })
+
+        let busy = SettingsToolbarAccessories.storeMenuItems(isRefreshing: true)
+        XCTAssertTrue(try XCTUnwrap(busy.first { $0.id == SettingsToolbarCommand.storeInstallFile }).isEnabled)
+        XCTAssertFalse(try XCTUnwrap(busy.first { $0.id == SettingsToolbarCommand.storeRefresh }).isEnabled,
+                       "a refresh already running must not be startable again")
+    }
+
+    // MARK: - Toolbar's + menu
+
+    func testTheShortcutsListOffersCustomActionAndInstall() {
+        let items = PreferencesPlusMenu.items(for: .shortcuts)
+        XCTAssertEqual(items.map(\.action), [.openCustomActions, .installExtensionFile])
+        XCTAssertFalse(items.contains { $0.startsGroup })
+    }
+
+    func testASingleActionPageKeepsAWordlessPlus() {
+        for (page, action): (SettingsPage, PreferencesToolbarAction) in [
+            (.ai, .addAIAction),
+        ] {
+            let items = PreferencesPlusMenu.items(for: page)
+            XCTAssertEqual(items.map(\.action), [action], "\(page) adds exactly one thing")
+            XCTAssertFalse(items.contains { $0.startsGroup })
+        }
+    }
+
+    func testPagesThatAddNothingShowNoMenu() {
+        for page in [SettingsPage.general, .store, .about, .customActions] {
+            XCTAssertTrue(PreferencesPlusMenu.items(for: page).isEmpty, "\(page) has no + menu")
+        }
+    }
+
+    func testActionMenuMatchesWhatTheActionAllows() {
+        let builtin = SettingsToolbarAccessories.actionMenuItems(.init(canDuplicate: false, canDelete: false))
+        XCTAssertTrue(builtin.isEmpty, "a built-in has no page-level actions, so no ellipsis at all")
+
+        let command = SettingsToolbarAccessories.actionMenuItems(.init(canDuplicate: true, canDelete: false))
+        XCTAssertEqual(command.map(\.id), [SettingsToolbarCommand.actionDuplicate])
+
+        let custom = SettingsToolbarAccessories.actionMenuItems(.init(canDuplicate: true, canDelete: true))
+        XCTAssertEqual(custom.map(\.id), [
+            SettingsToolbarCommand.actionDuplicate,
+            "action.separator",
+            SettingsToolbarCommand.actionDelete,
+        ])
+        XCTAssertEqual(custom.last?.role, .destructive)
+
+        let deleteOnly = SettingsToolbarAccessories.actionMenuItems(.init(canDuplicate: false, canDelete: true))
+        XCTAssertEqual(deleteOnly.map(\.id), [SettingsToolbarCommand.actionDelete])
+
+        let extAction = SettingsToolbarAccessories.actionMenuItems(.init(canDuplicate: false, canDelete: false, canUninstall: true))
+        XCTAssertEqual(extAction.map(\.id), [SettingsToolbarCommand.extensionUninstall])
+        XCTAssertEqual(extAction.last?.role, .destructive)
+    }
+
+    func testADestructiveConfirmationWaitsForTheRedButton() throws {
+        let router = SettingsRouter()
+        var uninstalled = false
+        router.confirmDestructive(title: "Uninstall JWT?", message: "Gone for good.", confirmTitle: "Uninstall") {
+            uninstalled = true
+        }
+
+        let notice = try XCTUnwrap(router.notice)
+        XCTAssertEqual(notice.style, .destructiveConfirmation)
+        XCTAssertEqual(notice.confirmTitle, "Uninstall")
+        XCTAssertTrue(notice.isConfirmation)
+        XCTAssertFalse(uninstalled, "posting the question must not do the thing")
+
+        router.dismissNotice()
+        XCTAssertFalse(uninstalled, "dismissing is a no")
+        XCTAssertNil(router.notice)
+
+        router.confirmDestructive(title: "Uninstall JWT?", message: "Gone for good.", confirmTitle: "Uninstall") {
+            uninstalled = true
+        }
+        router.confirmNotice()
+        XCTAssertTrue(uninstalled)
+        XCTAssertNil(router.notice, "answering takes the banner down")
+    }
+
+    func testAPlainNoticeHasNothingToConfirm() throws {
+        let router = SettingsRouter()
+        router.notifyError(title: "Remove Failed", message: "Nope")
+        XCTAssertFalse(try XCTUnwrap(router.notice).isConfirmation)
+        router.confirmNotice()
+        XCTAssertNil(router.notice, "confirming a plain notice just dismisses it")
+    }
+
+    func testPageCommandsReachTheSubscribedPage() {
+        let router = SettingsRouter()
+        var received: [String] = []
+        let token = router.pageCommands.sink { received.append($0) }
+        router.pageCommands.send(SettingsToolbarCommand.actionDuplicate)
+        router.pageCommands.send(SettingsToolbarCommand.actionDelete)
+        token.cancel()
+        XCTAssertEqual(received, [SettingsToolbarCommand.actionDuplicate, SettingsToolbarCommand.actionDelete])
+    }
+
+    // MARK: - Tints
+
+    func testAGeneratedExtensionTintIsNeverBlue() {
+        // Blue belongs to OpenClip's own rows, so nothing installed may land in that band however
+        // its identifier hashes.
+        var seen = Set<Int>()
+        for index in 0..<5_000 {
+            let hue = SettingsTint.hue(for: "com.example.extension.\(index)")
+            XCTAssertFalse(SettingsTint.reservedBlueHues.contains(hue),
+                           "id \(index) landed on hue \(hue), inside the reserved band")
+            XCTAssertTrue((0..<360).contains(hue), "hue \(hue) is not a hue")
+            seen.insert(hue)
+        }
+        XCTAssertGreaterThan(seen.count, 100, "the palette must still spread, not pile up on a few hues")
+
+        for id in ["io.appwrite.openclip", "com.openclip.jwt", "com.openclip.harper", "com.openclip.urlquery", ""] {
+            XCTAssertFalse(SettingsTint.reservedBlueHues.contains(SettingsTint.hue(for: id)), id)
+        }
+    }
+
+    func testAnExtensionKeepsTheSameTintEveryTime() {
+        let first = SettingsTint.hue(for: "com.openclip.jwt")
+        let again = SettingsTint.hue(for: "com.openclip.jwt")
+        XCTAssertEqual(first, again, "a package's colour must not move between launches")
+        XCTAssertNotEqual(first, SettingsTint.hue(for: "com.openclip.urlquery"))
+    }
+
+    func testTheSidebarsThreeKindsOfRowAreThreeColours() {
+        // Settings chrome uses blue/black/grey; extension colours must never borrow those.
+        let generated = SettingsPage.extensionPackage(id: "com.openclip.jwt").tint
+        for page in SettingsPage.systemPages {
+            XCTAssertNotEqual(page.tint, generated,
+                              "\(page.id) must not wear an extension's generated colour")
+        }
+
+        XCTAssertEqual(SettingsPage.ai.tint, SettingsTint.ai)
+        XCTAssertEqual(SettingsPage.customActions.tint, SettingsTint.openClip)
+        XCTAssertEqual(SettingsPage.builtinAction(id: "builtin.copy").tint, SettingsTint.openClip)
+
+        XCTAssertNotEqual(generated, SettingsPage.extensionPackage(id: "com.openclip.urlquery").tint)
+    }
+
+    // MARK: - Helpers
+
+    private static func extensionChrome(
+        package: String,
+        badgeName: String? = nil,
+        popupBehavior: ActionChrome.PopupBehavior = .perform
+    ) -> ActionChrome {
+        ActionChrome(
+            badge: badgeName.map { .extensionPkg($0) } ?? .none,
+            rowStyle: .standard,
+            popupBehavior: popupBehavior,
+            source: .extensionPkg(packageID: package)
+        )
+    }
+}
+
+private struct StubAction: Action, Sendable {
+    let id: String
+    let title: String
+    var icon: ActionIcon { .symbol("bolt") }
+    let chrome: ActionChrome
+
+    @MainActor func isEnabled(for context: ActionContext) -> Bool { true }
+    @MainActor func perform(_ context: ActionContext) async throws -> ActionResult { .none }
+}

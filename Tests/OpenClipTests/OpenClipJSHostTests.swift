@@ -1,0 +1,1681 @@
+import XCTest
+import JavaScriptCore
+@testable import Core
+@testable import OpenClip
+
+/// In-memory option store; never touches UserDefaults.
+fileprivate final class MemoryOptionStore: ActionOptionReading, ActionOptionWriting, @unchecked Sendable {
+    private var values: [String: String] = [:]
+
+    func stringValue(actionID: String, option: ExtensionOption) -> String {
+        values[SettingKey.actionOption(actionID: actionID, optionID: option.identifier).name]
+            ?? (option.defaultValue ?? "")
+    }
+
+    func setStringValue(_ value: String, actionID: String, option: ExtensionOption) {
+        values[SettingKey.actionOption(actionID: actionID, optionID: option.identifier).name] = value
+    }
+
+    func clearValue(actionID: String, option: ExtensionOption) {
+        values[SettingKey.actionOption(actionID: actionID, optionID: option.identifier).name] = ""
+    }
+}
+
+/// URLProtocol that serves canned responses, letting fetch tests run without real networking.
+final class MockURLProtocol: URLProtocol {
+    /// Only touched on the MainActor between tests.
+    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
+    /// Records requests but never responds, so the fetch stays pending.
+    nonisolated(unsafe) static var hangs = false
+    static let capturedRequests = LockedArray<URLRequest>()
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        if MockURLProtocol.hangs {
+            MockURLProtocol.capturedRequests.append(request)
+            return
+        }
+        guard let handler = MockURLProtocol.requestHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+        MockURLProtocol.capturedRequests.append(request)
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+final class LockedArray<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [T] = []
+    func append(_ value: T) {
+        lock.lock(); defer { lock.unlock() }
+        storage.append(value)
+    }
+    func removeAll() {
+        lock.lock(); defer { lock.unlock() }
+        storage.removeAll()
+    }
+    var values: [T] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+}
+
+final class OpenClipJSHostTests: XCTestCase {
+    private var host: OpenClipJSHost!
+    private var optionStore: MemoryOptionStore!
+
+    override func setUp() async throws {
+        try await super.setUp()
+        host = OpenClipJSHost()
+        optionStore = MemoryOptionStore()
+        MockURLProtocol.requestHandler = nil
+        MockURLProtocol.capturedRequests.removeAll()
+    }
+
+    private func makeContext(selectedText: String = "hello", match: ActionMatchInfo? = nil, isSecondaryClick: Bool = false) -> ActionContext {
+        let selection = SelectionContext(
+            text: selectedText,
+            sourceApp: AppIdentity(bundleIdentifier: "com.host.test", localizedName: "HostTestApp"),
+            cursorPosition: .zero,
+            timestamp: Date(),
+            appPolicy: .default
+        )
+        return ActionContext(selection: selection, isSecondaryClick: isSecondaryClick, match: match)
+    }
+
+    private func makeRequest(
+        script: String,
+        options: [ExtensionOption] = [],
+        rules: ExtensionActionRules = ExtensionActionRules(),
+        isAsync: Bool = false,
+        timeout: TimeInterval? = nil,
+        isSecondaryClick: Bool = false,
+        context: ActionContext? = nil,
+        pasteboardContent: OpenClipJSHost.PasteboardContent? = nil
+    ) -> OpenClipJSHost.Request {
+        OpenClipJSHost.Request(
+            actionID: "test.action",
+            scriptCode: script,
+            context: context ?? makeContext(isSecondaryClick: isSecondaryClick),
+            options: options,
+            optionStore: optionStore,
+            rules: rules,
+            isAsync: isAsync,
+            timeout: timeout,
+            pasteboardContent: pasteboardContent
+        )
+    }
+
+    private func makeMockedHost() -> OpenClipJSHost {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        return OpenClipJSHost(session: URLSession(configuration: config))
+    }
+
+    func testPasteEffectReturnsPaste() async throws {
+        let result = try await host.run(makeRequest(script: "openclip.paste('Hello World');"))
+        guard case .paste(let text) = result else {
+            return XCTFail("Expected .paste, got \(result)")
+        }
+        XCTAssertEqual(text, "Hello World")
+    }
+
+    func testCopyEffectReturnsCopy() async throws {
+        let result = try await host.run(makeRequest(script: "openclip.copy('Copied');"))
+        guard case .copy(let text) = result else {
+            return XCTFail("Expected .copy, got \(result)")
+        }
+        XCTAssertEqual(text, "Copied")
+    }
+
+    // MARK: - Console shim
+
+    /// `console.log` must not throw; it routes to Log.js and the script completes.
+    func testConsoleLogShimDoesNotThrowAndActionSucceeds() async throws {
+        let result = try await host.run(makeRequest(script: """
+            console.log('hello', 42, { a: 1 });
+            function action() { return 'ok'; }
+            """))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "ok")
+    }
+
+    /// The console shim must also be installed for async scripts (fetch path).
+    func testConsoleLogShimWorksInAsyncScript() async throws {
+        let result = try await host.run(makeRequest(script: """
+            console.log('async start');
+            async function action() { return 'ok'; }
+            """, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "ok")
+    }
+
+    /// Only the redacting `console.log` wrapper is exposed; `__log` must stay unreachable.
+    func testConsoleLogShimRemovesRawLogAccess() async throws {
+        let result = try await host.run(makeRequest(script: """
+            var exposed = (typeof console.__log);
+            var throws = false;
+            try { console.__log('raw text'); } catch (e) { throws = (e instanceof TypeError); }
+            function action() { return exposed + '|' + throws; }
+            """))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "undefined|true")
+    }
+
+    func testShowContentBridgeRemovedSurfacesError() async throws {
+        let script = "openclip.showContent(h('stack', {}, [h('text', { content: 'Hello' })]));"
+        let result = try await host.run(makeRequest(script: script))
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error, "calling the removed showContent bridge surfaces a JS error")
+    }
+
+    func testHHelperRemovedSurfacesError() async throws {
+        let script = "h('text', { content: 'Hello' });"
+        let result = try await host.run(makeRequest(script: script))
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error, "the h() helper is gone with the canvas feature")
+    }
+
+    func testRequireConfigurationReturnsOpenConfiguration() async throws {
+        let script = "openclip.requireConfiguration({ reason: 'Add your API key', missing: ['apiKey'] });"
+        let result = try await host.run(makeRequest(script: script))
+        guard case .openConfiguration(let config) = result else {
+            return XCTFail("Expected .openConfiguration, got \(result)")
+        }
+        XCTAssertEqual(config.actionID, "test.action")
+        XCTAssertEqual(config.reason, "Add your API key")
+        XCTAssertEqual(config.missingOptionIDs, ["apiKey"])
+    }
+
+    func testInputCapturesExposed() async throws {
+        let match = ActionMatchInfo(text: "a b", matchedText: "b", captures: ["c1", "c2"], sourceBundleID: nil)
+        let request = OpenClipJSHost.Request(
+            actionID: "test.action",
+            scriptCode: "return openclip.input.captures.join(',');",
+            context: makeContext(selectedText: "a b", match: match),
+            options: [],
+            optionStore: optionStore,
+            rules: ExtensionActionRules()
+        )
+        let result = try await host.run(request)
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "c1,c2")
+    }
+
+    func testInputIsSecondaryClickFlagBranchesScript() async throws {
+        let script = "function action(t){ return openclip.input.isSecondaryClick ? 'secondary' : 'primary'; }"
+
+        let primary = try await host.run(makeRequest(script: script, isSecondaryClick: false))
+        guard case .text(let primaryText) = primary else {
+            return XCTFail("Expected .text for primary click, got \(primary)")
+        }
+        XCTAssertEqual(primaryText, "primary")
+
+        let secondary = try await host.run(makeRequest(script: script, isSecondaryClick: true))
+        guard case .text(let secondaryText) = secondary else {
+            return XCTFail("Expected .text for secondary click, got \(secondary)")
+        }
+        XCTAssertEqual(secondaryText, "secondary")
+    }
+
+    func testInputMatchedTextAndAppExposed() async throws {
+        let match = ActionMatchInfo(text: "full text", matchedText: "text", captures: [], sourceBundleID: nil)
+        let script = "return openclip.input.matchedText + '|' + openclip.input.app.bundleID + '|' + openclip.input.app.name;"
+        let request = OpenClipJSHost.Request(
+            actionID: "test.action",
+            scriptCode: script,
+            context: makeContext(selectedText: "full text", match: match),
+            options: [],
+            optionStore: optionStore,
+            rules: ExtensionActionRules()
+        )
+        let result = try await host.run(request)
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "text|com.host.test|HostTestApp")
+    }
+
+    func testTypedBooleanOptionsDeliveredAsNativeBooleans() async throws {
+        let boolOption = ExtensionOption(identifier: "debugMode", label: "Debug", type: .boolean, defaultValue: "true")
+        let strOption = ExtensionOption(identifier: "prefix", label: "Prefix", type: .string, defaultValue: "http")
+        let script = "return typeof openclip.options.debugMode === 'boolean' && openclip.options.debugMode === true ? 'bool-ok' : 'fail';"
+        let request = makeRequest(script: script, options: [boolOption, strOption])
+        let result = try await host.run(request)
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "bool-ok")
+    }
+
+    func testRunShortcutDefaultInput() async throws {
+        let script = "openclip.runShortcut('MyShortcut');"
+        let request = makeRequest(script: script)
+        let result = try await host.run(request)
+        guard case .runShortcut(let name, let input) = result else {
+            return XCTFail("Expected .runShortcut, got \(result)")
+        }
+        XCTAssertEqual(name, "MyShortcut")
+        XCTAssertEqual(input, "hello")
+    }
+
+    func testRunShortcutCustomInputOverride() async throws {
+        let script = "openclip.runShortcut('MyShortcut', 'custom override text');"
+        let request = makeRequest(script: script)
+        let result = try await host.run(request)
+        guard case .runShortcut(let name, let input) = result else {
+            return XCTFail("Expected .runShortcut, got \(result)")
+        }
+        XCTAssertEqual(name, "MyShortcut")
+        XCTAssertEqual(input, "custom override text")
+    }
+
+    func testFunctionStringReturnBecomesText() async throws {
+        let result = try await host.run(makeRequest(script: "function action() { return 'result'; }"))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "result")
+    }
+
+    func testFunctionStringReturnProducesRawTextResult() async throws {
+        let raw = try await host.run(makeRequest(script: "function action() { return 'result'; }"))
+        guard case .text(let text) = raw else {
+            return XCTFail("Expected .text, got \(raw)")
+        }
+        XCTAssertEqual(text, "result")
+    }
+
+    func testExceptionReturnsErrorStatus() async throws {
+        let result = try await host.run(makeRequest(script: "throw new Error('boom');"))
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("boom"))
+    }
+
+    func testNotifyEffectReturnsNotify() async throws {
+        let result = try await host.run(makeRequest(script: "openclip.notify('Title', 'Body');"))
+        guard case .notify(let title, let body) = result else {
+            return XCTFail("Expected .notify, got \(result)")
+        }
+        XCTAssertEqual(title, "Title")
+        XCTAssertEqual(body, "Body")
+    }
+
+    func testShareServiceEffectReturnsShareService() async throws {
+        let result = try await host.run(makeRequest(
+            script: "openclip.shareService('com.apple.Notes.SharingExtension');"))
+        guard case .shareService(let identifier, let text) = result else {
+            return XCTFail("Expected .shareService, got \(result)")
+        }
+        XCTAssertEqual(identifier, "com.apple.Notes.SharingExtension")
+        XCTAssertEqual(text, "hello") // falls back to selection text when no text given
+    }
+
+    func testShareServiceEffectWithExplicitText() async throws {
+        let result = try await host.run(makeRequest(
+            script: "openclip.shareService('com.apple.Notes.SharingExtension', 'custom');"))
+        guard case .shareService(_, let text) = result else {
+            return XCTFail("Expected .shareService, got \(result)")
+        }
+        XCTAssertEqual(text, "custom")
+    }
+
+    func testMultipleEffectsSequenceInCallOrder() async throws {
+        let script = "openclip.copy('a'); openclip.paste('b');"
+        let result = try await host.run(makeRequest(script: script))
+        guard case .sequence(let items) = result else {
+            return XCTFail("Expected .sequence, got \(result)")
+        }
+        XCTAssertEqual(items.count, 2)
+        guard case .copy("a") = items[0], case .paste("b") = items[1] else {
+            return XCTFail("Unexpected sequence order \(items)")
+        }
+    }
+
+    func testToastCoexistsWithEffects() async throws {
+        let toastOnly = try await host.run(makeRequest(script: "openclip.toast('Done', 'success');"))
+        guard case .toast(let feedback) = toastOnly else {
+            return XCTFail("Expected .toast, got \(toastOnly)")
+        }
+        XCTAssertEqual(feedback.message, "Done")
+        XCTAssertEqual(feedback.style, .success)
+
+        let toastWithEffect = try await host.run(makeRequest(script: "openclip.toast('nope', 'error'); openclip.copy('c');"))
+        guard case .sequence(let items) = toastWithEffect else {
+            return XCTFail("Expected .sequence with toast + effect, got \(toastWithEffect)")
+        }
+        XCTAssertEqual(items.count, 2)
+        guard case .toast(let toast) = items[0], case .copy("c") = items[1] else {
+            return XCTFail("Unexpected sequence order \(items)")
+        }
+        XCTAssertEqual(toast.message, "nope")
+        XCTAssertEqual(toast.style, .error)
+    }
+
+    /// One-argument `toast` defaults to `.info`, matching the canvas bridge.
+    func testToastDefaultsToInfoWhenStyleOmitted() async throws {
+        let result = try await host.run(makeRequest(script: "openclip.toast('Done');"))
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.message, "Done")
+        XCTAssertEqual(feedback.style, .info)
+    }
+
+    func testToastKeepVisibleOption() async throws {
+        let result = try await host.run(makeRequest(script: "openclip.toast('Keep', 'info', { keepVisible: true });"))
+        guard case .toast(let feedback) = result else { return XCTFail("Expected .toast, got \(result)") }
+        XCTAssertTrue(feedback.keepVisible)
+    }
+
+    /// One-argument `keyPress` produces empty modifiers, matching the canvas bridge.
+    func testKeyPressDefaultsToEmptyModifiersWhenOmitted() async throws {
+        let result = try await host.run(makeRequest(script: "openclip.keyPress('return');"))
+        guard case .keyPress(let spec) = result else {
+            return XCTFail("Expected .keyPress, got \(result)")
+        }
+        XCTAssertEqual(spec.key, "return")
+        XCTAssertEqual(spec.modifiers, [])
+    }
+
+    func testOptionsReadOnlyViaOptionStore() async throws {
+        let option = ExtensionOption(identifier: "prefix", label: "Prefix", type: .string, defaultValue: "DEFAULT: ")
+        optionStore.setStringValue("SET: ", actionID: "test.action", option: option)
+        let script = "return openclip.options.prefix + '|' + openclip.option('prefix');"
+        let result = try await host.run(makeRequest(script: script, options: [option]))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "SET: |SET: ")
+    }
+
+    // MARK: - Async runtime (isAsync: true)
+
+    func testAsyncFunctionResolvesReturnValue() async throws {
+        let request = makeRequest(script: "async function action(text) { return 'async:' + text; }", isAsync: true)
+        let result = try await host.run(request)
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "async:hello")
+    }
+
+    func testAsyncTopLevelSideEffectsWithoutEntryPointSucceed() async throws {
+        let request = makeRequest(script: "openclip.copy('side');", isAsync: true)
+        let result = try await host.run(request)
+        guard case .copy(let text) = result else {
+            return XCTFail("Expected .copy, got \(result)")
+        }
+        XCTAssertEqual(text, "side")
+    }
+
+    func testPromiseRejectionSurfacesErrorToast() async throws {
+        let request = makeRequest(script: "function action() { return Promise.reject(new Error('async-boom')); }", isAsync: true)
+        let result = try await host.run(request)
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("async-boom"))
+    }
+
+    /// A throw after `await` rejects the action's promise.
+    func testThrowAfterAwaitSurfacesErrorToast() async throws {
+        let request = makeRequest(script: """
+            async function action() {
+                await Promise.resolve();
+                throw new Error('after-await-boom');
+            }
+            """, isAsync: true)
+        let result = try await host.run(request)
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("after-await-boom"), feedback.message)
+    }
+
+    /// A top-level throw is still a synchronous `evaluateScript` exception.
+    func testAsyncTopLevelThrowSurfacesErrorToast() async throws {
+        let request = makeRequest(script: "throw new Error('async-top-level');", isAsync: true)
+        let result = try await host.run(request)
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("async-top-level"), feedback.message)
+    }
+
+    func testAsyncSyntaxErrorSurfacesErrorToast() async throws {
+        let request = makeRequest(script: "function action() { return 'ok';", isAsync: true)
+        let result = try await host.run(request)
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertFalse(feedback.message.isEmpty)
+    }
+
+    func testCaughtThrowInsideAsyncActionStillSucceeds() async throws {
+        let request = makeRequest(script: """
+            async function action() {
+                try {
+                    throw new Error('handled-inside-action');
+                } catch (e) {
+                    return 'recovered';
+                }
+            }
+            """, isAsync: true)
+        let result = try await host.run(request)
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "recovered")
+    }
+
+    func testSyncModeIgnoresAsyncReturnValue() async throws {
+        // Legacy mode can't await a promise; a promise-like return must not paste "[object Promise]".
+        let result = try await host.run(makeRequest(script: "async function action() { return 'x'; }"))
+        guard case .success = result else {
+            return XCTFail("Expected .success, got \(result)")
+        }
+    }
+
+    // MARK: - Fetch polyfill
+
+    func testFetchGetReturnsStatusAndText() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("hello".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            const r = await openclip.fetch('https://example.com/ping');
+            return r.status + ':' + await r.text();
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "200:hello")
+    }
+
+    func testFetchPostSendsJSONBodyAndParsesResponse() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 201, httpVersion: nil, headerFields: nil)!
+            return (response, Data("{\"ok\":true}".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            const r = await openclip.fetch('https://example.com/api', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ q: 'hi' })
+            });
+            const body = await r.json();
+            return r.status + ':' + body.ok;
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "201:true")
+
+        let requests = MockURLProtocol.capturedRequests.values
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].httpMethod, "POST")
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Content-Type"), "application/json")
+        // URLSession moves httpBody to httpBodyStream before URLProtocol sees it.
+        let bodyData = requests[0].httpBody ?? Self.readStreamBody(requests[0])
+        XCTAssertEqual(bodyData.flatMap { String(data: $0, encoding: .utf8) }, "{\"q\":\"hi\"}")
+    }
+
+    private static func readStreamBody(_ request: URLRequest) -> Data? {
+        guard let stream = request.httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return data
+    }
+
+    func testFetchNetworkErrorRejectsPromise() async throws {
+        MockURLProtocol.requestHandler = { _ in
+            throw URLError(.notConnectedToInternet)
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            try {
+                await openclip.fetch('https://example.com/down');
+                return 'no-error';
+            } catch (e) {
+                return 'caught';
+            }
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "caught")
+    }
+
+    /// Issue #48: a throw in a native fetch callback must surface promptly, not via the idle watchdog.
+    func testNativeFetchCallbackThrowSurfacesErrorToastWithoutTimeout() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("ok".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let timeout: TimeInterval = 2
+        let script = """
+        function action() {
+            return new Promise(function(resolve, reject) {
+                openclip.__nativeFetch('https://example.com/ping', {}, function() {
+                    throw new Error('sentinel-callback-throw');
+                }, function(err) {
+                    reject(err);
+                });
+            });
+        }
+        """
+        let started = Date()
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true, timeout: timeout))
+        let elapsed = Date().timeIntervalSince(started)
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("sentinel-callback-throw"), feedback.message)
+        XCTAssertFalse(feedback.message.localizedCaseInsensitiveContains("timed out"), feedback.message)
+        XCTAssertLessThan(elapsed, timeout * 0.5, "escaped callback exception must not wait for the \(timeout)s watchdog, took \(elapsed)s")
+    }
+
+    /// Handled throws in the callback must not become global failures.
+    func testCaughtThrowInsideNativeFetchCallbackStillSucceeds() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("ok".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        function action() {
+            return new Promise(function(resolve, reject) {
+                openclip.__nativeFetch('https://example.com/ping', {}, function() {
+                    try {
+                        throw new Error('handled-in-callback');
+                    } catch (e) {
+                        resolve('recovered');
+                    }
+                }, function(err) {
+                    reject(err);
+                });
+            });
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true, timeout: 2))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "recovered")
+    }
+
+    /// Non-http(s) schemes are rejected before reaching URLSession.
+    func testFetchRejectsUnsupportedScheme() async throws {
+        MockURLProtocol.requestHandler = { _ in
+            throw URLError(.unsupportedURL)
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            try {
+                await openclip.fetch('file:///etc/passwd');
+                return 'no-error';
+            } catch (e) {
+                return 'rejected';
+            }
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "rejected")
+        XCTAssertTrue(MockURLProtocol.capturedRequests.values.isEmpty,
+                      "unsupported scheme must not reach the network")
+    }
+
+    /// The scheme allowlist is case-insensitive, so uppercase `HTTPS://` still loads.
+    func testFetchAcceptsCaseInsensitiveHTTPScheme() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("ok".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            const r = await openclip.fetch('HTTPS://example.com/up');
+            return r.status + ':' + await r.text();
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "200:ok")
+    }
+
+    /// Loopback is rejected before reaching URLSession.
+    func testFetchRejectsDirectLoopback() async throws {
+        MockURLProtocol.requestHandler = { _ in
+            throw URLError(.unsupportedURL)
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            try {
+                await openclip.fetch('http://127.0.0.1/secret');
+                return 'no-error';
+            } catch (e) {
+                return 'rejected';
+            }
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "rejected")
+        XCTAssertTrue(MockURLProtocol.capturedRequests.values.isEmpty,
+                      "loopback destination must not reach the network")
+    }
+
+    /// A public redirect to loopback is blocked before following; the original 302 resolves.
+    func testFetchRejectsRedirectToLoopback() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 302,
+                httpVersion: nil,
+                headerFields: ["Location": "http://127.0.0.1/secret"]
+            )!
+            return (response, Data())
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            const r = await openclip.fetch('https://public.example.com/redirect');
+            return String(r.status);
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "302", "redirect to loopback must be aborted, leaving the original 3xx response")
+        XCTAssertTrue(MockURLProtocol.capturedRequests.values.allSatisfy { $0.url?.host == "public.example.com" },
+                      "redirect must not be followed to a loopback host")
+    }
+
+    /// Unprivileged loopback ports are allowed.
+    func testFetchAllowsLoopbackWithSafePort() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "text/plain"]
+            )!
+            return (response, Data("local-ok".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            try {
+                const r = await openclip.fetch('http://127.0.0.1:8000/api');
+                return await r.text();
+            } catch (e) {
+                return 'rejected: ' + e.message;
+            }
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "local-ok")
+        XCTAssertEqual(MockURLProtocol.capturedRequests.values.first?.url?.host, "127.0.0.1")
+    }
+
+    func testFetchRejectsLoopbackOnPrivilegedPort() async throws {
+        MockURLProtocol.requestHandler = { _ in
+            throw URLError(.unsupportedURL)
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            try {
+                await openclip.fetch('http://127.0.0.1:80/secret');
+                return 'no-error';
+            } catch (e) {
+                return 'rejected';
+            }
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "rejected")
+        XCTAssertTrue(MockURLProtocol.capturedRequests.values.isEmpty)
+    }
+
+    /// Sensitive database/daemon ports (e.g. 6379, 5432, 2375, 9200) must be rejected.
+    func testFetchRejectsLoopbackOnBlockedDatabasePort() async throws {
+        MockURLProtocol.requestHandler = { _ in
+            throw URLError(.unsupportedURL)
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            try {
+                await openclip.fetch('http://localhost:6379/data');
+                return 'no-error';
+            } catch (e) {
+                return 'rejected';
+            }
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "rejected")
+        XCTAssertTrue(MockURLProtocol.capturedRequests.values.isEmpty)
+
+        let esScript = """
+        async function action() {
+            try {
+                await openclip.fetch('http://127.0.0.1:9200/_search');
+                return 'no-error';
+            } catch (e) {
+                return 'rejected';
+            }
+        }
+        """
+        let esResult = try await makeMockedHost().run(makeRequest(script: esScript, isAsync: true))
+        guard case .text(let esText) = esResult else {
+            return XCTFail("Expected .text, got \(esResult)")
+        }
+        XCTAssertEqual(esText, "rejected")
+        XCTAssertTrue(MockURLProtocol.capturedRequests.values.isEmpty)
+    }
+
+    /// Loopback support must NEVER allow private LAN IP addresses (RFC1918) or link-local addresses.
+    func testFetchStillRejectsPrivateLAN() async throws {
+        MockURLProtocol.requestHandler = { _ in
+            throw URLError(.unsupportedURL)
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let script = """
+        async function action() {
+            try {
+                await openclip.fetch('http://192.168.1.1:8000/admin');
+                return 'no-error';
+            } catch (e) {
+                return 'rejected';
+            }
+        }
+        """
+        let result = try await makeMockedHost().run(makeRequest(script: script, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "rejected")
+        XCTAssertTrue(MockURLProtocol.capturedRequests.values.isEmpty)
+    }
+
+    /// Removed tasks leave watchdog tracking; a later `cancelAll` must not touch them.
+    func testFetchTaskBoxRemovesByIdentifier() {
+        let box = FetchTaskBox()
+        let session = URLSession(configuration: .ephemeral)
+        func makeTask() -> URLSessionDataTask {
+            session.dataTask(with: URLRequest(url: URL(string: "https://example.com/x")!))
+        }
+        let a = makeTask()
+        let b = makeTask()
+        let c = makeTask()
+        box.add(a)
+        box.add(b)
+        box.add(c)
+
+        box.remove(b.taskIdentifier)
+
+        box.cancelAll()
+        XCTAssertNotEqual(b.state, .canceling, "removed task must not be cancelled")
+        XCTAssertEqual(a.state, .canceling)
+        XCTAssertEqual(c.state, .canceling)
+    }
+
+    /// Close handler runs exactly once on `finish()` or `cancelAll()`, never while open (issue #46).
+    func testFetchTaskBoxCloseHandlerRunsOnce() {
+        let finished = FetchTaskBox()
+        let finishMarks = LockedArray<String>()
+        finished.setCloseHandler { finishMarks.append("close") }
+        finished.finish()
+        finished.finish()
+        finished.cancelAll()
+        XCTAssertEqual(finishMarks.values, ["close"])
+
+        let cancelled = FetchTaskBox()
+        let cancelMarks = LockedArray<String>()
+        cancelled.setCloseHandler { cancelMarks.append("close") }
+        cancelled.cancelAll()
+        XCTAssertEqual(cancelMarks.values, ["close"])
+
+        let open = FetchTaskBox()
+        let openMarks = LockedArray<String>()
+        open.setCloseHandler { openMarks.append("close") }
+        XCTAssertEqual(openMarks.values, [])
+    }
+
+    /// A handler installed after close runs immediately, so late cleanup is never dropped.
+    func testFetchTaskBoxCloseHandlerRegisteredAfterCloseRunsImmediately() {
+        let box = FetchTaskBox()
+        box.finish()
+        let marks = LockedArray<String>()
+        box.setCloseHandler { marks.append("close") }
+        XCTAssertEqual(marks.values, ["close"])
+    }
+
+    /// `add` racing `cancelAll` must never let a task escape cancellation.
+    func testFetchTaskBoxAddConcurrentWithCancelAllCancelsAll() {
+        let box = FetchTaskBox()
+        let session = URLSession(configuration: .ephemeral)
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "fetchbox.race", attributes: .concurrent)
+        let addLock = NSLock()
+        final class AddedTracker: @unchecked Sendable {
+            var list: [URLSessionDataTask] = []
+        }
+        let added = AddedTracker()
+
+        let producerCount = 8
+        let perProducer = 100
+        for _ in 0..<producerCount {
+            queue.async(group: group) {
+                for _ in 0..<perProducer {
+                    let task = session.dataTask(with: URLRequest(url: URL(string: "https://example.com/x")!))
+                    addLock.lock()
+                    added.list.append(task)
+                    addLock.unlock()
+                    box.add(task)
+                }
+            }
+        }
+        queue.async(group: group) {
+            box.cancelAll()
+        }
+        group.wait()
+
+        addLock.lock()
+        let all = added.list
+        addLock.unlock()
+        XCTAssertEqual(all.count, producerCount * perProducer)
+        // Cancelled tasks are `.canceling` or `.completed`; `.suspended` means it escaped.
+        for task in all {
+            XCTAssertNotEqual(task.state, .suspended, "every added task must be cancelled, got \(task.state)")
+        }
+    }
+
+    // MARK: - Fetch lifetime
+
+    /// A fetch completing after its evaluation ended must not re-enter that JS VM.
+    /// Ends context A with `cancelAll()` so the test compiles and fails on unmodified main.
+    func testStaleFetchCompletionDoesNotReenterFinishedContext() {
+        XCTAssertTrue(Thread.isMainThread)
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("ok".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let marks = LockedArray<String>()
+
+        let contextA = JSContext()!
+        contextA.evaluateScript("var openclip = {};")
+        let markA: @convention(block) () -> Void = { marks.append("A") }
+        contextA.setObject(markA, forKeyedSubscript: "__mark" as NSString)
+        let boxA = FetchTaskBox()
+        JSNativeFetch.installNativeFetch(in: contextA, session: session, fetchTasks: boxA)
+        contextA.evaluateScript("openclip.__nativeFetch('https://example.com/a', {}, function(){ __mark(); }, function(){ __mark(); });")
+        boxA.cancelAll()
+
+        let contextB = JSContext()!
+        contextB.evaluateScript("var openclip = {};")
+        let markB: @convention(block) () -> Void = { marks.append("B") }
+        contextB.setObject(markB, forKeyedSubscript: "__mark" as NSString)
+        let boxB = FetchTaskBox()
+        JSNativeFetch.installNativeFetch(in: contextB, session: session, fetchTasks: boxB)
+        contextB.evaluateScript("openclip.__nativeFetch('https://example.com/b', {}, function(){ __mark(); }, function(){ __mark(); });")
+
+        let deadline = Date().addingTimeInterval(2)
+        while !marks.values.contains("B") {
+            if Date() > deadline {
+                XCTFail("B's fetch completion did not run within 2 s")
+                return
+            }
+            CFRunLoopRunInMode(.defaultMode, 0.01, false)
+        }
+        for _ in 0..<20 {
+            CFRunLoopRunInMode(.defaultMode, 0.01, false)
+        }
+        XCTAssertEqual(marks.values.filter { $0 == "A" }.count, 0)
+    }
+
+    /// When an evaluation finishes normally via `finish()`, in-flight requests that complete
+    /// successfully (200 OK) must also be discarded and never invoke resolve/callbacks.
+    func testStaleSuccessfulFetchCompletionDoesNotReenterFinishedContext() {
+        XCTAssertTrue(Thread.isMainThread)
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("ok".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let marks = LockedArray<String>()
+
+        let contextA = JSContext()!
+        contextA.evaluateScript("var openclip = {};")
+        let markA: @convention(block) () -> Void = { marks.append("A") }
+        contextA.setObject(markA, forKeyedSubscript: "__mark" as NSString)
+        let boxA = FetchTaskBox()
+        JSNativeFetch.installNativeFetch(in: contextA, session: session, fetchTasks: boxA)
+        contextA.evaluateScript("openclip.__nativeFetch('https://example.com/a', {}, function(){ __mark(); }, function(){ __mark(); });")
+        boxA.finish()
+
+        let contextB = JSContext()!
+        contextB.evaluateScript("var openclip = {};")
+        let markB: @convention(block) () -> Void = { marks.append("B") }
+        contextB.setObject(markB, forKeyedSubscript: "__mark" as NSString)
+        let boxB = FetchTaskBox()
+        JSNativeFetch.installNativeFetch(in: contextB, session: session, fetchTasks: boxB)
+        contextB.evaluateScript("openclip.__nativeFetch('https://example.com/b', {}, function(){ __mark(); }, function(){ __mark(); });")
+
+        let deadline = Date().addingTimeInterval(2)
+        while !marks.values.contains("B") {
+            if Date() > deadline {
+                XCTFail("B's fetch completion did not run within 2 s")
+                return
+            }
+            CFRunLoopRunInMode(.defaultMode, 0.01, false)
+        }
+        for _ in 0..<20 {
+            CFRunLoopRunInMode(.defaultMode, 0.01, false)
+        }
+        XCTAssertEqual(marks.values.filter { $0 == "A" }.count, 0)
+    }
+
+    /// Guards the stale-completion test: fails first if the mock or pump path breaks.
+    func testFetchCompletionSettlesWhileEvaluationIsLive() {
+        XCTAssertTrue(Thread.isMainThread)
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("ok".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let marks = LockedArray<String>()
+
+        let context = JSContext()!
+        context.evaluateScript("var openclip = {};")
+        let mark: @convention(block) () -> Void = { marks.append("live") }
+        context.setObject(mark, forKeyedSubscript: "__mark" as NSString)
+        let box = FetchTaskBox()
+        JSNativeFetch.installNativeFetch(in: context, session: session, fetchTasks: box)
+        context.evaluateScript("openclip.__nativeFetch('https://example.com/live', {}, function(){ __mark(); }, function(){ __mark(); });")
+
+        let deadline = Date().addingTimeInterval(2)
+        while !marks.values.contains("live") {
+            if Date() > deadline {
+                XCTFail("live fetch completion did not run within 2 s")
+                return
+            }
+            CFRunLoopRunInMode(.defaultMode, 0.01, false)
+        }
+        XCTAssertEqual(marks.values.filter { $0 == "live" }.count, 1)
+    }
+
+    /// The finished JSContext must deallocate; no block or closure may retain it (issue #47).
+    func testFetchBridgeDoesNotRetainContextAfterRun() {
+        XCTAssertTrue(Thread.isMainThread)
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("{\"a\":1}".utf8))
+        }
+        defer { MockURLProtocol.requestHandler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        let collected = LockedArray<String>()
+        weak var weakContext: JSContext?
+        // Own autorelease pool: JSC receipts must not keep the context alive past the assertion.
+        autoreleasepool {
+            var context: JSContext? = JSContext()
+            weakContext = context
+            context!.evaluateScript("var openclip = {};")
+            let box = FetchTaskBox()
+            JSNativeFetch.installNativeFetch(in: context!, session: session, fetchTasks: box)
+
+            let mark: @convention(block) () -> Void = { collected.append("done") }
+            context!.setObject(mark, forKeyedSubscript: "__mark" as NSString)
+            // json() is the block that used to create a retain cycle.
+            context!.evaluateScript("openclip.fetch('https://example.com/x').then(function(r){ r.json(); __mark(); }, function(){ __mark(); });")
+
+            let deadline = Date().addingTimeInterval(2)
+            while !collected.values.contains("done") && Date() < deadline {
+                CFRunLoopRunInMode(.defaultMode, 0.01, false)
+            }
+            XCTAssertTrue(collected.values.contains("done"), "the mocked fetch must settle")
+            box.finish()
+            context = nil
+        }
+
+        XCTAssertEqual(collected.values, ["done"])
+        XCTAssertNil(weakContext, "the finished JSContext must deallocate (no retain cycle)")
+    }
+
+    /// A cancelled fetch must not keep the JSContext alive once `clearPending()` drops its resolvers (issue #47).
+    func testCancelledFetchDoesNotRetainContextAfterResolverCleanup() {
+        XCTAssertTrue(Thread.isMainThread)
+        MockURLProtocol.hangs = true
+        defer { MockURLProtocol.hangs = false }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        weak var weakContext: JSContext?
+        autoreleasepool {
+            var context: JSContext? = JSContext()
+            weakContext = context
+            context!.evaluateScript("var openclip = {};")
+            let box = FetchTaskBox()
+            let resolvers = JSNativeFetch.installNativeFetch(in: context!, session: session, fetchTasks: box)
+            XCTAssertNotNil(resolvers)
+
+            context!.evaluateScript("openclip.fetch('https://example.com/hang').then(function(){}, function(){});")
+            for _ in 0..<20 { CFRunLoopRunInMode(.defaultMode, 0.01, false) }
+
+            box.finish()                 // invalidate the session, cancelling the pending task
+            resolvers?.clearPending()    // what OpenClipJSHost.evaluate does at run end
+            context = nil
+        }
+
+        for _ in 0..<50 { CFRunLoopRunInMode(.defaultMode, 0.01, false) }
+        XCTAssertNil(weakContext, "a cancelled fetch must not keep the JSContext alive")
+    }
+
+    // MARK: - Watchdog
+
+    func testTimeoutThrowsForNeverSettlingPromise() async throws {
+        let request = makeRequest(script: "function action() { return new Promise(function() {}); }", isAsync: true, timeout: 0.05)
+        do {
+            _ = try await host.run(request)
+            return XCTFail("Expected timeout to throw")
+        } catch {
+            let nsError = error as NSError
+            XCTAssertEqual(nsError.domain, Constants.actionErrorDomain)
+            XCTAssertTrue(nsError.localizedDescription.contains("timed out"))
+        }
+    }
+
+    /// Cancelling a pending evaluation throws `CancellationError`, not a JS exception or timeout.
+    func testCancelledPendingPromiseThrowsCancellationError() async throws {
+        let host = self.host!
+        let request = makeRequest(
+            script: "function action() { return new Promise(function() {}); }",
+            isAsync: true,
+            timeout: 5
+        )
+        let task = Task {
+            try await host.run(request)
+        }
+        try await Task.sleep(nanoseconds: 80_000_000)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
+    // MARK: - Manifest requiredOptions short-circuit (Phase 7)
+
+    /// Missing required options short-circuit to `.openConfiguration` before the JS body runs.
+    func testMissingRequiredOptionsShortCircuitsToOpenConfigurationBeforeJSRuns() async throws {
+        let option = ExtensionOption(identifier: "apiKey", label: "API Key", type: .secret, defaultValue: nil)
+        let rules = ExtensionActionRules(requirements: ActionRequirements(requiredOptions: ["apiKey"]))
+        let action = JavaScriptAction(
+            id: "test.required",
+            title: "Required",
+            iconSymbol: "terminal",
+            scriptCode: "throw new Error('must not run');",
+            options: [option],
+            optionStore: MemoryOptionStore(),
+            rules: rules
+        )
+
+        let result = try await action.perform(makeContext())
+        guard case .openConfiguration(let config) = result else {
+            return XCTFail("Expected .openConfiguration, got \(result)")
+        }
+        XCTAssertEqual(config.actionID, "test.required")
+        XCTAssertEqual(config.missingOptionIDs, ["apiKey"])
+        XCTAssertEqual(config.reason, "Required option not set.")
+    }
+
+    func testMissingRequiredOptionsRunsNormallyWhenStoreSet() async throws {
+        let option = ExtensionOption(identifier: "apiKey", label: "API Key", type: .secret, defaultValue: nil)
+        let store = MemoryOptionStore()
+        store.setStringValue("secret", actionID: "test.required", option: option)
+        let rules = ExtensionActionRules(requirements: ActionRequirements(requiredOptions: ["apiKey"]))
+        let action = JavaScriptAction(
+            id: "test.required",
+            title: "Required",
+            iconSymbol: "terminal",
+            scriptCode: "function action() { return 'ran'; }",
+            options: [option],
+            optionStore: store,
+            rules: rules
+        )
+
+        let result = try await action.perform(makeContext())
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "ran")
+    }
+
+    // MARK: - JS modules (packageDirectory != nil)
+
+    /// Writes a temp package; `files` maps relative path to content.
+    private func makeModulePackage(_ files: [String: String]) throws -> URL {
+        let package = FileManager.default.temporaryDirectory.appendingPathComponent("host-module-\(UUID().uuidString)")
+        for (path, content) in files {
+            let url = package.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try content.write(to: url, atomically: true, encoding: .utf8)
+        }
+        addTeardownBlock { try? FileManager.default.removeItem(at: package) }
+        return package
+    }
+
+    private func makeModuleRequest(script: String, package: URL, entryDirectory: URL? = nil, isAsync: Bool = false, timeout: TimeInterval? = nil) -> OpenClipJSHost.Request {
+        OpenClipJSHost.Request(
+            actionID: "test.action",
+            scriptCode: script,
+            context: makeContext(),
+            options: [],
+            optionStore: optionStore,
+            rules: ExtensionActionRules(),
+            isAsync: isAsync,
+            timeout: timeout,
+            packageDirectory: package,
+            entryDirectory: entryDirectory
+        )
+    }
+
+    func testNestedEntryModuleResolvesRelativeRequires() async throws {
+        let package = try makeModulePackage([
+            "src/helper.js": "module.exports = { greet: function(name) { return 'Hello ' + name; } };",
+            "src/main.js": "var h = require('./helper.js'); function action(text) { return h.greet(text); }"
+        ])
+        let srcDir = package.appendingPathComponent("src")
+        let script = try String(contentsOf: package.appendingPathComponent("src/main.js"), encoding: .utf8)
+        let result = try await host.run(makeModuleRequest(script: script, package: package, entryDirectory: srcDir))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "Hello hello")
+    }
+
+    func testModulePackageRequiresLocalHelper() async throws {
+        let package = try makeModulePackage([
+            "lib/helper.js": "module.exports = { upper: function(s) { return s.toUpperCase(); } };"
+        ])
+        let script = "function action(text) { return require('./lib/helper.js').upper(text); }"
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "HELLO")
+    }
+
+    func testCJSModuleExportsActionEntryForm() async throws {
+        let package = try makeModulePackage([:])
+        let script = "module.exports = { action: function(selection, options) { return 'cjs'; } };"
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "cjs")
+    }
+
+    func testDirectFunctionExportEntryForm() async throws {
+        let package = try makeModulePackage([:])
+        let script = "module.exports = function action() { return 'direct'; };"
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "direct")
+    }
+
+    func testModuleCacheAndSingletonAcrossRequires() async throws {
+        let package = try makeModulePackage([
+            "libB.js": "var n = (globalThis.__loads = (globalThis.__loads || 0) + 1); module.exports = { n: n };",
+            "libA.js": "module.exports = { b: require('./libB.js') };"
+        ])
+        let script = """
+        var a = require('./libA.js');
+        var a2 = require('./libA.js');
+        var b = require('./libB.js');
+        function action() { return a.b.n + '|' + b.n + '|' + (a === a2) + '|' + (a.b === b); }
+        """
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "1|1|true|true")
+    }
+
+    func testModuleCycleResolvesWithPartialExports() async throws {
+        let package = try makeModulePackage([
+            "a.js": "module.exports.fromB = require('./b.js').name;",
+            "b.js": "module.exports.name = 'bee'; module.exports.aLoaded = (typeof require('./a.js') === 'object');"
+        ])
+        let script = """
+        var a = require('./a.js');
+        function action() { return a.fromB + '|' + require('./b.js').aLoaded; }
+        """
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "bee|true")
+    }
+
+    func testMissingModuleShowsErrorStatus() async throws {
+        let package = try makeModulePackage([:])
+        let script = "function action() { require('./nope.js'); return 'x'; }"
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("Cannot find module"))
+        XCTAssertTrue(feedback.message.contains("nope.js"))
+    }
+
+    func testNodeBuiltinRequireShowsErrorStatus() async throws {
+        let package = try makeModulePackage([:])
+        let script = "function action() { require('fs'); }"
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("Node builtin"))
+        XCTAssertTrue(feedback.message.contains("fs"))
+    }
+
+    func testAsyncModulePackageResolvesHelper() async throws {
+        let package = try makeModulePackage([
+            "lib/up.js": "module.exports = { up: function(s) { return s.toUpperCase(); } };"
+        ])
+        let script = "module.exports = { action: async function(text) { return require('./lib/up.js').up(text); } };"
+        let result = try await host.run(makeModuleRequest(script: script, package: package, isAsync: true))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "HELLO")
+    }
+
+    func testJavaScriptActionPerformThreadsPackageDirectory() async throws {
+        let package = try makeModulePackage([
+            "u.js": "module.exports = function(s) { return s.toUpperCase(); };"
+        ])
+        let action = JavaScriptAction(
+            id: "pkg.main",
+            title: "Pkg",
+            iconSymbol: "terminal",
+            scriptCode: "function action(t) { return require('./u.js')(t); }",
+            options: [],
+            chrome: nil,
+            optionStore: MemoryOptionStore(),
+            rules: nil,
+            isAsync: false,
+            packageDirectory: package
+        )
+        let result = try await action.perform(makeContext())
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "HELLO")
+    }
+
+    /// Writes a JS module outside every package; a leak shows as `.text("LEAKED")`.
+    private func makeOutsideModule() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("host-module-outside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("secret.js")
+        try "module.exports = 'LEAKED';".write(to: url, atomically: true, encoding: .utf8)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return url
+    }
+
+    /// Issue #39, end to end through `require`.
+    func testRequireOfSymlinkedFileOutsidePackageShowsErrorStatus() async throws {
+        let package = try makeModulePackage(["README.md": "fixture"])
+        let secret = try makeOutsideModule()
+        try FileManager.default.createSymbolicLink(at: package.appendingPathComponent("leak.js"), withDestinationURL: secret)
+        let script = "function action() { return require('./leak'); }"
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .toast(let feedback) = result else {
+            return XCTFail("Expected .toast, got \(result)")
+        }
+        XCTAssertEqual(feedback.style, .error)
+        XCTAssertTrue(feedback.message.contains("resolves outside the extension package"), feedback.message)
+        XCTAssertTrue(feedback.message.contains("./leak"), feedback.message)
+        XCTAssertFalse(feedback.message.contains("LEAKED"), "file contents must never reach the script")
+    }
+
+    /// The raw resolver bridge must refuse the same targets that `require` refuses.
+    func testResolveModuleBridgeRefusesSymlinkedFileOutsidePackage() async throws {
+        let package = try makeModulePackage(["README.md": "fixture"])
+        let secret = try makeOutsideModule()
+        try FileManager.default.createSymbolicLink(at: package.appendingPathComponent("leak.js"), withDestinationURL: secret)
+        let script = """
+        function action() {
+            var r = openclip.__resolveModule(__dirname, './leak');
+            return r.ok ? 'LEAKED:' + r.source : 'blocked:' + r.message;
+        }
+        """
+        let result = try await host.run(makeModuleRequest(script: script, package: package))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertTrue(text.hasPrefix("blocked:"), text)
+        XCTAssertTrue(text.contains("resolves outside the extension package"), text)
+        XCTAssertFalse(text.contains("LEAKED"), "raw file contents must never reach the script")
+    }
+
+    func testInputHtmlAndRtf() async throws {
+        let selection = SelectionContext(
+            text: "Hello",
+            sourceApp: AppIdentity(bundleIdentifier: "com.apple.Safari", localizedName: "Safari"),
+            cursorPosition: .zero,
+            timestamp: Date(),
+            appPolicy: .default,
+            html: "<b>Hello</b>",
+            rtf: "{\\rtf1 Hello}"
+        )
+        let context = ActionContext(selection: selection)
+        let script = "function action() { return openclip.input.html + ' | ' + openclip.input.rtf; }"
+        let request = makeRequest(script: script, context: context)
+        let result = try await host.run(request)
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "<b>Hello</b> | {\\rtf1 Hello}")
+    }
+
+    func testPasteContentWithUTIKeys() async throws {
+        let script = """
+        function action() {
+            openclip.pasteContent({
+                'public.utf8-plain-text': 'Plain',
+                'public.html': '<i>Italic</i>',
+                'public.rtf': '{\\\\rtf1 RTF}'
+            });
+        }
+        """
+        let result = try await host.run(makeRequest(script: script))
+        guard case .pasteContent(let payload) = result else {
+            return XCTFail("Expected .pasteContent, got \(result)")
+        }
+        XCTAssertEqual(payload.plainText, "Plain")
+        XCTAssertEqual(payload.html, "<i>Italic</i>")
+        XCTAssertEqual(payload.rtf, "{\\rtf1 RTF}")
+    }
+
+    func testCopyContentWithShorthandKeys() async throws {
+        let script = """
+        function action() {
+            openclip.copyContent({
+                text: 'Plain Copy',
+                html: '<b>Bold Copy</b>',
+                rtf: '{\\\\rtf1 Bold}'
+            });
+        }
+        """
+        let result = try await host.run(makeRequest(script: script))
+        guard case .copyContent(let payload) = result else {
+            return XCTFail("Expected .copyContent, got \(result)")
+        }
+        XCTAssertEqual(payload.plainText, "Plain Copy")
+        XCTAssertEqual(payload.html, "<b>Bold Copy</b>")
+        XCTAssertEqual(payload.rtf, "{\\rtf1 Bold}")
+    }
+
+    func testRichPayloadWithNoRepresentationIsIgnored() async throws {
+        for call in ["openclip.pasteContent({})", "openclip.copyContent({})"] {
+            let script = "function action() { \(call); }"
+            let result = try await host.run(makeRequest(script: script))
+            guard case .success = result else {
+                return XCTFail("Expected .success for \(call), got \(result)")
+            }
+        }
+    }
+
+    func testI18nFallsBackToBaseLanguage() async throws {
+        let script = """
+        function action() {
+            openclip.language = 'fr-CA';
+            return openclip.i18n({ 'fr': 'Bonjour', 'en': 'Hello' });
+        }
+        """
+        let result = try await host.run(makeRequest(script: script))
+        guard case .text(let text) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(text, "Bonjour")
+    }
+
+    // MARK: - openclip.pasteboard API Tests
+
+    func testPasteboardReadPlainText() async throws {
+        let pb = OpenClipJSHost.PasteboardContent(text: "Existing Clipboard Text", hasContent: true, types: ["public.utf8-plain-text"])
+        let script = """
+        function action(sel) {
+            return "PB: " + openclip.pasteboard.text + " | SEL: " + sel;
+        }
+        """
+        let result = try await host.run(makeRequest(script: script, pasteboardContent: pb))
+        guard case .text(let output) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(output, "PB: Existing Clipboard Text | SEL: hello")
+    }
+
+    func testPasteboardReadHtmlAndRtf() async throws {
+        let pb = OpenClipJSHost.PasteboardContent(
+            text: "Plain",
+            html: "<b>Rich</b>",
+            rtf: "{\\rtf1 Rich}",
+            hasContent: true,
+            hasHtml: true,
+            hasRtf: true,
+            types: ["public.utf8-plain-text", "public.html", "public.rtf"]
+        )
+        let script = """
+        function action() {
+            return openclip.pasteboard.html + " / " + openclip.pasteboard.rtf;
+        }
+        """
+        let result = try await host.run(makeRequest(script: script, pasteboardContent: pb))
+        guard case .text(let output) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(output, "<b>Rich</b> / {\\rtf1 Rich}")
+    }
+
+    func testPasteboardConcealedPasswordRedacted() async throws {
+        // ConcealedType marker returns empty text/html/rtf and hasContent false
+        let pb = OpenClipJSHost.PasteboardContent(
+            text: "",
+            html: "",
+            rtf: "",
+            hasContent: false,
+            hasHtml: false,
+            hasRtf: false,
+            types: ["org.nspasteboard.ConcealedType", "public.utf8-plain-text"]
+        )
+        let script = """
+        function action() {
+            if (openclip.pasteboard.hasContent) {
+                return "FAIL: has content";
+            }
+            return "CONCEALED: '" + openclip.pasteboard.text + "'";
+        }
+        """
+        let result = try await host.run(makeRequest(script: script, pasteboardContent: pb))
+        guard case .text(let output) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(output, "CONCEALED: ''")
+    }
+
+    func testPasteboardHasContentAndTypes() async throws {
+        let pb = OpenClipJSHost.PasteboardContent(
+            text: "Some note",
+            hasContent: true,
+            hasHtml: false,
+            hasRtf: false,
+            types: ["public.utf8-plain-text"]
+        )
+        let script = """
+        function action() {
+            var hasText = openclip.pasteboard.hasContent;
+            var typeCount = openclip.pasteboard.types.length;
+            return "has=" + hasText + ", types=" + typeCount;
+        }
+        """
+        let result = try await host.run(makeRequest(script: script, pasteboardContent: pb))
+        guard case .text(let output) = result else {
+            return XCTFail("Expected .text, got \(result)")
+        }
+        XCTAssertEqual(output, "has=true, types=1")
+    }
+
+    func testPasteboardTextSetterTriggersCopy() async throws {
+        let pb = OpenClipJSHost.PasteboardContent(text: "Initial Clip", hasContent: true)
+        let script = """
+        function action(sel) {
+            openclip.pasteboard.text = openclip.pasteboard.text + "\\n" + sel;
+        }
+        """
+        let result = try await host.run(makeRequest(script: script, pasteboardContent: pb))
+        guard case .copy(let text) = result else {
+            return XCTFail("Expected .copy, got \(result)")
+        }
+        XCTAssertEqual(text, "Initial Clip\nhello")
+    }
+
+    func testPasteboardContentSetterTriggersCopyContent() async throws {
+        let pb = OpenClipJSHost.PasteboardContent(
+            text: "Hello",
+            html: "<b>Hello</b>",
+            hasContent: true,
+            hasHtml: true
+        )
+        let script = """
+        function action(sel) {
+            openclip.pasteboard.content = {
+                text: openclip.pasteboard.text + " " + sel,
+                html: openclip.pasteboard.html + " <i>" + sel + "</i>"
+            };
+        }
+        """
+        let result = try await host.run(makeRequest(script: script, pasteboardContent: pb))
+        guard case .copyContent(let payload) = result else {
+            return XCTFail("Expected .copyContent, got \(result)")
+        }
+        XCTAssertEqual(payload.plainText, "Hello hello")
+        XCTAssertEqual(payload.html, "<b>Hello</b> <i>hello</i>")
+    }
+}

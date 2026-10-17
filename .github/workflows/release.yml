@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # Sigstore signs the provenance keylessly: id-token mints the OIDC token that
+  # identifies this workflow to Fulcio, attestations stores the resulting bundle.
+  id-token: write
+  attestations: write
+
+jobs:
+  package-and-release:
+    name: Package App & Create Release
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Signing degrades rather than fails. If the certificate or the notary credentials are
+      # missing — a fork, or secrets that were rotated away — the release still builds and
+      # publishes, ad-hoc signed, with a warning on the run. Gatekeeper refuses an ad-hoc build
+      # on every Mac but the one that produced it, so this is a visible degradation and not a
+      # silent one. All five secrets are required together: a certificate without notary
+      # credentials would sign successfully and then fail minutes later at the notarization step.
+      - name: Determine signing mode
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          MISSING=""
+          [ -n "$CERT_P12" ] || MISSING="$MISSING MACOS_CERTIFICATE_P12"
+          [ -n "$CERT_PASSWORD" ] || MISSING="$MISSING MACOS_CERTIFICATE_PASSWORD"
+          [ -n "$NOTARY_KEY_P8" ] || MISSING="$MISSING NOTARY_KEY_P8"
+          [ -n "$NOTARY_KEY_ID" ] || MISSING="$MISSING NOTARY_KEY_ID"
+          [ -n "$NOTARY_ISSUER_ID" ] || MISSING="$MISSING NOTARY_ISSUER_ID"
+
+          if [ -z "$MISSING" ]; then
+            echo "mode=developer-id" >> "$GITHUB_OUTPUT"
+            # "auto" resolves against the keychain rather than naming the certificate here. The
+            # temporary keychain built below holds exactly one Developer ID Application identity,
+            # and scripts/signing_config.sh fails loudly if it ever finds none or several — so the
+            # Team ID never has to be repeated as a secret where it could drift.
+            echo "identity=auto" >> "$GITHUB_OUTPUT"
+            echo "allow_unsigned=0" >> "$GITHUB_OUTPUT"
+            echo "Signing mode: Developer ID (signed, notarized, stapled)"
+          else
+            echo "::warning title=Unsigned release::Missing signing secrets:$MISSING. Building ad-hoc and skipping notarization — Gatekeeper will refuse these artifacts. See docs/developer-guide/signing-and-notarization.md."
+            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            echo "allow_unsigned=1" >> "$GITHUB_OUTPUT"
+            echo "Signing mode: ad-hoc (NOT distributable)"
+          fi
+
+      - name: Select Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.6'
+
+      # Plain `security` commands rather than a third-party action: the private key for Talkra's
+      # signing certificate passes through this step, and the same reasoning that pins the Sparkle
+      # download by SHA-256 applies to anything handling it. The keychain is created in RUNNER_TEMP,
+      # is never the default keychain, and is deleted by the cleanup step below whatever happens.
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.mode == 'developer-id'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/talkra-signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          # Random per-run: this password only ever guards a keychain that is destroyed with the
+          # runner, so there is nothing to gain by making it a secret.
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          (umask 077; printf '%s' "$CERT_P12" | base64 --decode > "$CERT_PATH")
+          if [ ! -s "$CERT_PATH" ]; then
+            echo "error: MACOS_CERTIFICATE_P12 did not base64-decode to anything." >&2
+            echo "       Re-create it with: base64 -i Certificates.p12 | pbcopy" >&2
+            exit 1
+          fi
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Without this the keychain re-locks on a timeout partway through a long build and
+          # codesign starts failing with "User interaction is not allowed".
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$CERT_PASSWORD" \
+            -f pkcs12 \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          rm -f "$CERT_PATH"
+
+          # -T above grants the tools access; this is the half that stops the keychain prompting
+          # for confirmation on a runner where no one can click anything.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH" > /dev/null
+
+          # Prepend to the user search list, keeping the existing keychains so nothing else in the
+          # job loses access to the login keychain.
+          #
+          # Each entry is unquoted and trimmed individually into an array rather than being
+          # word-split out of a command substitution. `security list-keychains` prints its paths
+          # indented and in quotes, and feeding that output straight back in is how a search list
+          # ends up holding one mangled entry instead of a path — at which point every identity
+          # silently disappears and codesign fails with no useful message.
+          EXISTING_KEYCHAINS=()
+          while IFS= read -r kc; do
+            kc="$(printf '%s' "$kc" | sed -e 's/^[[:space:]]*"\{0,1\}//' -e 's/"\{0,1\}[[:space:]]*$//')"
+            [ -n "$kc" ] && EXISTING_KEYCHAINS+=("$kc")
+          done < <(security list-keychains -d user)
+
+          # "${arr[@]}" on an empty array is an unbound-variable error under set -u in bash 3.2,
+          # which is what macOS ships.
+          if [ "${#EXISTING_KEYCHAINS[@]}" -gt 0 ]; then
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "${EXISTING_KEYCHAINS[@]}"
+          else
+            security list-keychains -d user -s "$KEYCHAIN_PATH"
+          fi
+          echo "Search list is now:"
+          security list-keychains -d user
+
+          FOUND="$(security find-identity -v -p codesigning | grep -c "Developer ID Application" || true)"
+          if [ "$FOUND" -ne 1 ]; then
+            echo "error: expected exactly 1 Developer ID Application identity after import, found $FOUND." >&2
+            security find-identity -v -p codesigning >&2
+            exit 1
+          fi
+          echo "Imported the signing certificate into a temporary keychain."
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Download Sparkle CLI Tools
+        run: |
+          mkdir -p /tmp/sparkle scripts/bin
+          SPARKLE_SHA256="52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192"
+          curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz" -o /tmp/Sparkle-2.9.6.tar.xz
+          echo "$SPARKLE_SHA256  /tmp/Sparkle-2.9.6.tar.xz" | shasum -a 256 -c -
+          tar xJ -f /tmp/Sparkle-2.9.6.tar.xz -C /tmp/sparkle
+          cp -R /tmp/sparkle/bin/. scripts/bin/
+
+      - name: Build & Package Release (.zip, .dmg, & appcast.xml)
+        id: build_package
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          OPENCLIP_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          OPENCLIP_ALLOW_UNSIGNED_RELEASE: ${{ steps.signing.outputs.allow_unsigned }}
+          # scripts/notarize_artifact.sh accepts the key as inline PEM text as well as a path, so
+          # the .p8 never has to be written to the workspace by this workflow.
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          ./scripts/release_update.sh "$VERSION"
+          ZIP_FILE="build/release/Talkra-v${VERSION}.zip"
+          SHA256=$(shasum -a 256 "$ZIP_FILE" | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "Built Talkra v$VERSION with SHA256: $SHA256"
+
+      # The Sparkle appcast is signed, so the auto-update path is already covered.
+      # This covers the other one: a .zip or .dmg downloaded straight off the
+      # Releases page can be traced back to the tag and workflow run that built it.
+      #   gh attestation verify Talkra-v<version>.dmg --repo ganeshmshetty/talkra \
+      #     --signer-workflow ganeshmshetty/talkra/.github/workflows/release.yml
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v4
+        continue-on-error: true
+        with:
+          subject-path: |
+            build/release/*.zip
+            build/release/*.dmg
+
+      - name: Extract Release Notes from CHANGELOG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="## v$VERSION" '
+            $0 ~ ver { flag=1; next }
+            flag && /^## v/ { flag=0 }
+            flag { print }
+          ' CHANGELOG.md > /tmp/release_notes.md
+          cat /tmp/release_notes.md
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: /tmp/release_notes.md
+          files: |
+            build/release/*.zip
+            build/release/*.dmg
+            build/release/appcast.xml
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
+          generate_release_notes: false
+          overwrite: true
+
+      # GitHub's `releases/latest` never resolves to a pre-release, so a beta build cannot be
+      # served from a version-specific tag: the app's fixed beta feed URL is
+      # releases/download/beta/appcast.xml. Mirroring the artifacts onto a rolling `beta`
+      # pre-release gives that URL one stable home that always holds the newest beta. Stable
+      # tags skip this entirely.
+      - name: Publish rolling beta channel
+        if: contains(github.ref, '-')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta
+          name: Beta
+          body: |
+            Latest beta build of Talkra.
+
+            Install the stable app and choose **Settings › About › Update Channel › Beta** to
+            receive these automatically.
+          prerelease: true
+          files: |
+            build/release/*.zip
+            build/release/*.dmg
+            build/release/appcast.xml
+          overwrite_files: true
+
+      - name: Update Homebrew Tap
+        if: "!contains(github.ref, '-')"
+        continue-on-error: true
+        env:
+          TOKEN: ${{ secrets.TAP_GITHUB_TOKEN || secrets.HOMEBREW_TAP_TOKEN || secrets.PAT }}
+          VERSION: ${{ steps.build_package.outputs.version }}
+          SHA256: ${{ steps.build_package.outputs.sha256 }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning ::No TAP_GITHUB_TOKEN or HOMEBREW_TAP_TOKEN secret configured. Skipping Homebrew tap update."
+            exit 0
+          fi
+          echo "==> Updating ganeshmshetty/homebrew-tap cask..."
+          rm -rf /tmp/homebrew-tap
+          git clone "https://x-access-token:${TOKEN}@github.com/ganeshmshetty/homebrew-tap.git" /tmp/homebrew-tap
+          cd /tmp/homebrew-tap
+          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" Casks/talkra.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA256}\"/" Casks/talkra.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/talkra.rb
+          if git diff --staged --quiet; then
+            echo "No changes to Casks/talkra.rb"
+          else
+            git commit -m "talkra ${VERSION}"
+            git push origin master
+            echo "Successfully updated ganeshmshetty/homebrew-tap Casks/talkra.rb to v${VERSION} (${SHA256})"
+          fi
+
+      # if: always() so a failed build, or a cancelled run, still takes the private key with it.
+      # GitHub discards the runner either way, but leaving an unlocked keychain holding a
+      # Developer ID private key behind for the rest of the job is not something to rely on
+      # cleanup-by-VM-teardown for.
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+            echo "Deleted the temporary signing keychain."
+          fi
+          rm -f "$RUNNER_TEMP/certificate.p12"

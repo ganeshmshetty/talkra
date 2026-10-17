@@ -1,0 +1,48 @@
+// AppFilter.swift
+// OpenClip
+//
+// Maintains exclusion pattern lists to prevent OpenClip from running on unsupported system or game applications.
+import Foundation
+
+public struct AppFilter: Sendable {
+    public static let excludedBundleIDPatterns: [String] = [
+        "com.adobe.*",
+        "com.adobe.aerendercore",
+        "com.amazon.Kindle",
+        "com.apple.CharacterPaletteIM",
+        "com.apple.dock",
+        "com.apple.iphonesimulator",
+        "com.google.android.emulator",
+        "com.android.emulator",
+        "com.apple.systemuiserver",
+        "com.blizzard.*",
+        "com.codeweavers.*",
+        "com.collectorz.*",
+        "com.openclip.*",
+        "com.talkra.*",       // Never trigger on ourselves
+        "com.oracle.SQLDeveloper",
+        "com.parallels.*",
+        "com.pilotmoon.popclip",
+        "com.pixelmatorteam.*",
+        "com.revolversoftware.office",
+        "com.screencastomatic.app",
+        "com.unity3d.*",
+        "com.vmware.*",
+        "net.java.openjdk.cmd",
+        "org.keepassx.keepassx",
+        "com.edovia.screens.*"
+    ]
+    
+    public static func isExcluded(bundleID: String) -> Bool {
+        for pattern in excludedBundleIDPatterns {
+            if pattern.hasSuffix(".*") {
+                let prefix = String(pattern.dropLast(2))
+                // Exact match OR subdomain match — prevents "com.foo" matching "com.foobar"
+                if bundleID == prefix || bundleID.hasPrefix(prefix + ".") { return true }
+            } else {
+                if bundleID == pattern { return true }
+            }
+        }
+        return false
+    }
+}
